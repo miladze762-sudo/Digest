@@ -4,15 +4,24 @@
 
 **Цель:** Добавить Playwright browser fallback к HTTP-first извлечению статей и закрыть Trigger.dev runtime-контракт для Chromium.
 
-**Архитектура:** Trigger.dev build устанавливает Playwright runtime через `@trigger.dev/build/extensions/playwright`, а Python-пайплайн использует async Playwright только при провале HTTP-слоя. Preflight проверяет запуск Chromium до чтения Telegram и до создания NotebookLM, чтобы отсутствие браузера считалось deploy-контрактной ошибкой.
+**Архитектура:** Trigger.dev build устанавливает Playwright runtime через `@trigger.dev/build/extensions/playwright`, а Python-пайплайн использует async Playwright только при провале HTTP-слоя. Версия Playwright закрепляется одинаково в Node dependency, Python dependency и Trigger.dev extension, чтобы Chromium build-контракт был воспроизводимым. Preflight проверяет запуск Chromium до чтения Telegram и до создания NotebookLM, чтобы отсутствие браузера считалось deploy-контрактной ошибкой.
 
-**Технологический стек:** Trigger.dev SDK `4.4.x`, `@trigger.dev/build` Playwright extension, Python `playwright`, Chromium, httpx, trafilatura, readability-lxml, pytest-asyncio.
+**Технологический стек:** Trigger.dev SDK `4.4.x`, `@trigger.dev/build` Playwright extension, Node `playwright`, Python `playwright`, Chromium, httpx, trafilatura, readability-lxml, pytest-asyncio.
 
 ---
 
 ## Предусловие
 
-Сначала выполнить основной план `docs/superpowers/plans/2026-06-26-triggerdev-ciscrypted-digest.md` до конца. Этот план модифицирует уже созданные файлы `trigger.config.ts`, `requirements.txt`, `.env.example`, `src/digest/article_extractor.py`, `src/digest/preflight.py` и добавляет `src/digest/playwright_article_extractor.py`.
+Сначала выполнить основной план `docs/superpowers/plans/2026-06-26-triggerdev-ciscrypted-digest.md` до конца. Этот план модифицирует уже созданные файлы `package.json`, `trigger.config.ts`, `requirements.txt`, `.env.example`, `src/digest/config.py`, `src/digest/article_extractor.py`, `src/digest/preflight.py`, `src/digest/pipeline.py` и добавляет `src/digest/playwright_article_extractor.py`.
+
+## Что уже дает основной план
+
+- `DigestSettings` уже содержит `enable_playwright_fallback`, а `.env.example` уже документирует `ENABLE_PLAYWRIGHT_FALLBACK=false`. В этом плане не добавлять это поле повторно; нужно только обновить значение флага при включении fallback и добавить новые поля `playwright_timeout_ms` и `playwright_wait_until`.
+- `src/digest/article_extractor.py` уже содержит `ArticleFallback`, `DisabledBrowserFallback`, `HttpArticleExtractor` и критерии вызова fallback: пустой текст, короткий текст, JS-заглушка или HTTP-ошибка.
+- `src/digest/pipeline.py` уже создает `HttpArticleExtractor` с `DisabledBrowserFallback()`. Этот план заменяет только создание fallback через factory, не переписывая orchestration.
+- `src/digest/preflight.py` уже проверяет Python imports, `ffmpeg` и `state_store`. Этот план добавляет браузерный smoke-check только когда `ENABLE_PLAYWRIGHT_FALLBACK=true`.
+
+Trade-off: Playwright повышает надежность извлечения JS-страниц, но увеличивает размер build image, время dry-run/deploy и runtime-стоимость. Поэтому HTTP-слой остается первым, а браузер запускается только как fallback и только при включенном флаге.
 
 ## Источники
 
@@ -21,9 +30,10 @@
 
 ## Структура файлов
 
-- Изменить: `package.json` — оставить `@trigger.dev/build` в `devDependencies`; без него Playwright extension не импортируется.
-- Изменить: `trigger.config.ts` — добавить `playwright({ browsers: ["chromium"], headless: true })`.
-- Изменить: `requirements.txt` — добавить Python-пакет `playwright`.
+- Изменить: `package.json` — оставить `@trigger.dev/build` в `devDependencies` и добавить Node `playwright` той же версии, что Python-пакет.
+- Изменить: `package-lock.json` — зафиксировать lockfile после `npm install`, если он создается или уже существует.
+- Изменить: `trigger.config.ts` — добавить `playwright({ browsers: ["chromium"], headless: true, version: PLAYWRIGHT_VERSION })`.
+- Изменить: `requirements.txt` — добавить Python-пакет `playwright` той же версии, что Node dependency.
 - Изменить: `.env.example` — включить browser fallback flags.
 - Создать: `src/digest/playwright_article_extractor.py` — async Chromium extractor.
 - Изменить: `src/digest/article_extractor.py` — выбирать Playwright fallback по config.
@@ -35,6 +45,8 @@
 ### Задача 1: Trigger.dev build-контракт для Playwright
 
 **Файлы:**
+- Изменить: `package.json`
+- Изменить: `package-lock.json`
 - Изменить: `trigger.config.ts`
 - Изменить: `requirements.txt`
 - Изменить: `.env.example`
@@ -42,7 +54,13 @@
 
 - [ ] **Шаг 1: Расширить тест env-контракта**
 
-Изменить `tests/test_env_contract.py`, чтобы `test_env_example_documents_required_digest_variables` включал эти имена:
+Изменить `tests/test_env_contract.py`, чтобы файл импортировал `json`:
+
+```python
+import json
+```
+
+Изменить `test_env_example_documents_required_digest_variables`, чтобы он включал эти имена:
 
 ```python
 required_names.update(
@@ -57,16 +75,44 @@ required_names.update(
 Изменить `test_trigger_python_requirements_include_digest_dependencies`, чтобы список включал:
 
 ```python
-"playwright",
+"playwright==1.49.1",
+```
+
+Добавить тест build-контракта версии Playwright:
+
+```python
+def test_playwright_runtime_versions_are_pinned_together() -> None:
+    package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    trigger_config = (ROOT / "trigger.config.ts").read_text(encoding="utf-8")
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    assert package["devDependencies"]["playwright"] == "1.49.1"
+    assert 'const PLAYWRIGHT_VERSION = "1.49.1";' in trigger_config
+    assert "version: PLAYWRIGHT_VERSION" in trigger_config
+    assert "playwright==1.49.1" in requirements
 ```
 
 - [ ] **Шаг 2: Запустить сфокусированный тест и убедиться, что он падает**
 
 Команда: `python -m pytest tests/test_env_contract.py -v`
 
-Ожидаемо: FAIL, потому что `PLAYWRIGHT_TIMEOUT_MS`, `PLAYWRIGHT_WAIT_UNTIL` и `playwright` еще не задокументированы.
+Ожидаемо: FAIL, потому что `PLAYWRIGHT_TIMEOUT_MS`, `PLAYWRIGHT_WAIT_UNTIL`, `playwright==1.49.1` и Node `playwright` еще не задокументированы.
 
 - [ ] **Шаг 3: Добавить Trigger.dev Playwright extension**
+
+Изменить `package.json`, чтобы `devDependencies` содержал Node Playwright той же версии, что Python-пакет:
+
+```json
+"playwright": "1.49.1"
+```
+
+Запустить:
+
+```powershell
+npm install
+```
+
+Ожидаемо: npm устанавливает зависимости и создает или обновляет `package-lock.json`.
 
 Изменить `trigger.config.ts` до такого точного содержимого:
 
@@ -77,6 +123,7 @@ import { ffmpeg } from "@trigger.dev/build/extensions/core";
 import { playwright } from "@trigger.dev/build/extensions/playwright";
 
 const project = process.env.TRIGGER_PROJECT_REF;
+const PLAYWRIGHT_VERSION = "1.49.1";
 
 if (!project) {
   throw new Error("TRIGGER_PROJECT_REF обязателен для Trigger.dev build");
@@ -94,6 +141,7 @@ export default defineConfig({
       playwright({
         browsers: ["chromium"],
         headless: true,
+        version: PLAYWRIGHT_VERSION,
       }),
       ffmpeg(),
     ],
@@ -106,7 +154,7 @@ export default defineConfig({
 Добавить в `requirements.txt`:
 
 ```text
-playwright
+playwright==1.49.1
 ```
 
 Обновить `.env.example`:
@@ -119,7 +167,12 @@ PLAYWRIGHT_WAIT_UNTIL=domcontentloaded
 
 - [ ] **Шаг 5: Запустить сфокусированный тест и убедиться, что он проходит**
 
-Команда: `python -m pytest tests/test_env_contract.py -v`
+Команда:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pytest tests/test_env_contract.py -v
+```
 
 Ожидаемо: PASS.
 
@@ -128,7 +181,8 @@ PLAYWRIGHT_WAIT_UNTIL=domcontentloaded
 Команда:
 
 ```powershell
-git add trigger.config.ts requirements.txt .env.example tests/test_env_contract.py
+git add package.json trigger.config.ts requirements.txt .env.example tests/test_env_contract.py
+if (Test-Path package-lock.json) { git add package-lock.json }
 git commit -m "feat: add Playwright runtime contract"
 ```
 
@@ -231,23 +285,29 @@ class PlaywrightArticleExtractor:
     async def extract(self, url: str) -> ExtractedArticle:
         try:
             async with async_playwright() as runtime:
+                browser = None
+                context = None
                 browser = await runtime.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/126.0.0.0 Safari/537.36"
-                    )
-                )
-                page = await context.new_page()
-                await page.goto(url, wait_until=self.wait_until, timeout=self.timeout_ms)
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=min(self.timeout_ms, 5000))
-                except PlaywrightTimeoutError:
-                    pass
-                html = await page.content()
-                await context.close()
-                await browser.close()
+                    context = await browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/126.0.0.0 Safari/537.36"
+                        )
+                    )
+                    page = await context.new_page()
+                    await page.goto(url, wait_until=self.wait_until, timeout=self.timeout_ms)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=min(self.timeout_ms, 5000))
+                    except PlaywrightTimeoutError:
+                        pass
+                    html = await page.content()
+                finally:
+                    if context is not None:
+                        await context.close()
+                    if browser is not None:
+                        await browser.close()
             text = extract_text_from_rendered_html(html, url)
             if len(text) < self.min_text_length:
                 return ExtractedArticle(
@@ -287,6 +347,7 @@ class PlaywrightArticleExtractor:
 Команда:
 
 ```powershell
+python -m pip install -r requirements.txt
 python -m playwright install chromium
 python -c "from digest.playwright_article_extractor import PlaywrightArticleExtractor; print(PlaywrightArticleExtractor(timeout_ms=1000, wait_until='domcontentloaded', min_text_length=10))"
 ```
@@ -313,7 +374,7 @@ git commit -m "feat: add Playwright article extractor"
 - Тест: `tests/test_config.py`
 - Тест: `tests/test_article_extractor.py`
 
-- [ ] **Шаг 1: Расширить config-тесты**
+- [ ] **Шаг 1: Расширить config- и fallback-тесты**
 
 Изменить `tests/test_config.py`:
 
@@ -338,26 +399,55 @@ def test_settings_reads_playwright_flags(monkeypatch: pytest.MonkeyPatch) -> Non
     assert settings.playwright_wait_until == "domcontentloaded"
 ```
 
-- [ ] **Шаг 2: Запустить config-тесты и убедиться, что они падают**
+Изменить `tests/test_article_extractor.py`, чтобы проверить factory для браузерного fallback:
 
-Команда: `python -m pytest tests/test_config.py -v`
+```python
+from digest.article_extractor import DisabledBrowserFallback, build_article_fallback
+from digest.playwright_article_extractor import PlaywrightArticleExtractor
 
-Ожидаемо: FAIL, потому что `DigestSettings` пока не содержит поля Playwright.
+
+def test_build_article_fallback_returns_disabled_fallback_when_flag_off() -> None:
+    fallback = build_article_fallback(
+        enabled=False,
+        timeout_ms=25000,
+        wait_until="domcontentloaded",
+        min_text_length=600,
+    )
+
+    assert isinstance(fallback, DisabledBrowserFallback)
+
+
+def test_build_article_fallback_returns_playwright_fallback_when_flag_on() -> None:
+    fallback = build_article_fallback(
+        enabled=True,
+        timeout_ms=25000,
+        wait_until="domcontentloaded",
+        min_text_length=600,
+    )
+
+    assert isinstance(fallback, PlaywrightArticleExtractor)
+```
+
+- [ ] **Шаг 2: Запустить config- и fallback-тесты и убедиться, что они падают**
+
+Команда: `python -m pytest tests/test_config.py tests/test_article_extractor.py -v`
+
+Ожидаемо: FAIL, потому что `DigestSettings` пока не содержит `playwright_timeout_ms` и `playwright_wait_until`, а `build_article_fallback` еще не существует.
 
 - [ ] **Шаг 3: Добавить поля config**
 
 Изменить `src/digest/config.py` dataclass fields:
 
 ```python
-    enable_playwright_fallback: bool
     playwright_timeout_ms: int
     playwright_wait_until: str
 ```
 
+Не добавлять `enable_playwright_fallback` повторно: это поле уже создано основным планом.
+
 Изменить `DigestSettings.from_env()`:
 
 ```python
-            enable_playwright_fallback=_bool_env("ENABLE_PLAYWRIGHT_FALLBACK", False),
             playwright_timeout_ms=_int_env("PLAYWRIGHT_TIMEOUT_MS", 25000),
             playwright_wait_until=os.getenv("PLAYWRIGHT_WAIT_UNTIL", "domcontentloaded"),
 ```
@@ -405,7 +495,7 @@ from digest.article_extractor import HttpArticleExtractor, build_article_fallbac
 Команда:
 
 ```powershell
-python -m pytest tests/test_config.py tests/test_article_extractor.py -v
+python -m pytest tests/test_config.py tests/test_article_extractor.py tests/test_pipeline.py -v
 ```
 
 Ожидаемо: PASS.
@@ -415,7 +505,7 @@ python -m pytest tests/test_config.py tests/test_article_extractor.py -v
 Команда:
 
 ```powershell
-git add src/digest/config.py src/digest/article_extractor.py src/digest/pipeline.py tests/test_config.py tests/test_article_extractor.py
+git add src/digest/config.py src/digest/article_extractor.py src/digest/pipeline.py tests/test_config.py tests/test_article_extractor.py tests/test_pipeline.py
 git commit -m "feat: wire Playwright fallback into extraction"
 ```
 
@@ -440,6 +530,7 @@ from digest.preflight import PreflightError, validate_playwright_wait_until
 
 
 def test_validate_playwright_wait_until_accepts_known_values() -> None:
+    validate_playwright_wait_until("commit")
     validate_playwright_wait_until("domcontentloaded")
     validate_playwright_wait_until("load")
     validate_playwright_wait_until("networkidle")
@@ -473,11 +564,15 @@ async def check_playwright_browser() -> None:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as runtime:
+        browser = None
         browser = await runtime.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.set_content("<html><body>ok</body></html>")
-        text = await page.text_content("body")
-        await browser.close()
+        try:
+            page = await browser.new_page()
+            await page.set_content("<html><body>ok</body></html>")
+            text = await page.text_content("body")
+        finally:
+            if browser is not None:
+                await browser.close()
     if text != "ok":
         raise PreflightError("Playwright Chromium smoke check вернул неожиданный текст")
 ```
@@ -507,12 +602,12 @@ python -m pytest tests/test_preflight.py tests/test_preflight_playwright.py -v
 
 ```powershell
 python -m playwright install chromium
-python - <<'PY'
+@'
 import asyncio
 from digest.preflight import check_playwright_browser
 asyncio.run(check_playwright_browser())
 print("playwright ok")
-PY
+'@ | python -
 ```
 
 Ожидаемо: команда печатает `playwright ok`.
@@ -537,7 +632,7 @@ git commit -m "feat: verify Playwright runtime in preflight"
 
 Добавить в `README.md`:
 
-```markdown
+````markdown
 ## Playwright fallback
 
 Для локального dev mode Trigger.dev build extension не устанавливает браузер автоматически, поэтому один раз выполнить:
@@ -549,9 +644,12 @@ python -m playwright install chromium
 В Production Chromium устанавливает Trigger.dev build extension:
 
 ```ts
+const PLAYWRIGHT_VERSION = "1.49.1";
+
 playwright({
   browsers: ["chromium"],
   headless: true,
+  version: PLAYWRIGHT_VERSION,
 })
 ```
 
@@ -562,7 +660,7 @@ $env:ENABLE_PLAYWRIGHT_FALLBACK="true"
 python -m pytest tests/test_playwright_article_extractor.py tests/test_preflight_playwright.py -v
 npm run trigger:dry-run
 ```
-```
+````
 
 - [ ] **Шаг 2: Запустить полный локальный набор тестов**
 
@@ -600,9 +698,9 @@ git commit -m "docs: document Playwright fallback"
 
 ## Самопроверка
 
-- Покрытие спеки: Playwright fallback срабатывает, когда HTTP-извлечение пустое, слишком короткое, похоже на JS-заглушку или завершилось ошибкой; Trigger.dev runtime устанавливает Chromium; preflight запускает браузер до Telegram/NotebookLM side effects.
+- Покрытие спеки: Playwright fallback срабатывает, когда HTTP-извлечение пустое, слишком короткое, похоже на JS-заглушку или завершилось ошибкой; Trigger.dev runtime устанавливает Chromium; Node/Python версии Playwright закреплены одинаково; preflight запускает браузер до Telegram/NotebookLM side effects.
 - Проверка placeholder-маркеров: запрещенных маркеров из раздела No Placeholders не найдено.
-- Согласованность типов: `PlaywrightArticleExtractor.extract()` возвращает `ExtractedArticle` с `extraction_method="playwright"` и подключается к протоколу `ArticleFallback` из основного плана.
+- Согласованность типов: `PlaywrightArticleExtractor.extract()` возвращает `ExtractedArticle` с `extraction_method="playwright"`, подключается к протоколу `ArticleFallback` из основного плана, а `DigestSettings` расширяется только новыми полями `playwright_timeout_ms` и `playwright_wait_until`.
 
 План готов и сохранен в `docs/superpowers/plans/2026-06-26-playwright-article-fallback.md`. Два варианта исполнения:
 
