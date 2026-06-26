@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.trigger/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.mp3
+*.mp4
+runtime/
+credentials/

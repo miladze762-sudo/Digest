@@ -1,0 +1,10 @@
+telethon
+notebooklm-py
+trafilatura
+readability-lxml
+httpx
+beautifulsoup4
+lxml
+psycopg[binary]
+pytest
+pytest-asyncio

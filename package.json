@@ -1,0 +1,23 @@
+{
+  "name": "ciscrypted-digest-triggerdev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run && python -m pytest",
+    "test:trigger": "vitest run src/trigger",
+    "test:python": "python -m pytest",
+    "trigger:dry-run": "trigger.dev deploy --dry-run",
+    "trigger:deploy": "trigger.dev deploy"
+  },
+  "dependencies": {
+    "@trigger.dev/python": "4.4.6",
+    "@trigger.dev/sdk": "4.4.6",
+    "luxon": "3.5.0"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "4.4.6",
+    "@types/node": "22.13.1",
+    "typescript": "5.7.3",
+    "vitest": "2.1.8"
+  }
+}
