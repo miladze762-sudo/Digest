@@ -10,6 +10,7 @@ if (!project) {
 
 export default defineConfig({
   project,
+  maxDuration: 7200,
   dirs: ["./src/trigger"],
   build: {
     extensions: [

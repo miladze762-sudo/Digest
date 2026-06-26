@@ -2,17 +2,18 @@
 
 > **Для агентных исполнителей:** ОБЯЗАТЕЛЬНЫЙ SUB-SKILL: используйте `superpowers:subagent-driven-development` (рекомендуется) или `superpowers:executing-plans`, чтобы выполнять план по задачам. Для отслеживания шагов используется синтаксис checkbox (`- [ ]`).
 
-**Цель:** Построить Trigger.dev-пайплайн, который ежедневно берет последний дайджест `ciscrypted`, извлекает статьи HTTP-слоем, создает NotebookLM-блокнот, генерирует Audio Overview и отправляет MP3 в Telegram без дублей при повторах.
+**Цель:** Построить Trigger.dev-пайплайн, который ежедневно берет последний дайджест `ciscrypted`, извлекает текст постов из других Telegram-каналов по ссылкам в дайджесте, создает NotebookLM-блокнот, генерирует Audio Overview и отправляет MP3 в Telegram без дублей при повторах.
 
-**Архитектура:** TypeScript отвечает за Trigger.dev schedule wrapper, idempotent processor task и запуск Python CLI через `@trigger.dev/python`. Python-пакет `digest` содержит доменную модель, чтение Telegram, извлечение ссылок и статей, `state_store`, NotebookLM/Telegram-клиенты, preflight и orchestration. Тяжелый Playwright browser fallback вынесен в отдельный план `docs/superpowers/plans/2026-06-26-playwright-article-fallback.md`; этот план оставляет явный интерфейс fallback и рабочий HTTP-first пайплайн.
+**Архитектура:** TypeScript отвечает за Trigger.dev schedule wrapper, idempotent processor task и запуск Python CLI через `@trigger.dev/python`. Python-пакет `digest` содержит доменную модель, чтение Telegram, извлечение ссылок на Telegram-посты, чтение связанных постов через Telethon, `state_store`, NotebookLM/Telegram-клиенты, preflight и orchestration. Внешние side effects идут через явные checkpoints в `state_store`: cleanup, создание блокнота, добавление источников, генерация/скачивание аудио и отправка MP3. Внешние сайты по ссылкам не скачиваются: ссылки первого поста считаются ссылками на посты в других Telegram-каналах.
 
-**Технологический стек:** Trigger.dev SDK `4.4.x`, `@trigger.dev/sdk/v3`, `@trigger.dev/python`, TypeScript, Vitest, Python 3.11+, pytest, Telethon, httpx, trafilatura, readability-lxml, beautifulsoup4, notebooklm-py, psycopg, ffmpeg.
+**Технологический стек:** Trigger.dev SDK `4.4.x`, `@trigger.dev/sdk/v3`, `@trigger.dev/python`, TypeScript, Vitest, Python 3.11+, pytest, Telethon, httpx, notebooklm-py, psycopg, ffmpeg.
 
 ---
 
 ## Источники
 
 - Спека: `docs/superpowers/specs/2026-06-26-triggerdev-telegram-notebooklm-digest-design.md`
+- Уточнение пользователя от 2026-06-26: ссылки в первом посте ведут на посты в других Telegram-каналах; данные нужно извлекать из этих Telegram-постов, а не с сайтов.
 - Локальная инструкция деплоя: `docs/triggerdev-script-deploy-instructions.md`
 - `notebooklm-py` Python API: `https://github.com/teng-lin/notebooklm-py/blob/main/docs/python-api.md` (`NotebookLMClient.from_storage()`, `client.notebooks.create()`, `client.sources.add_text()`, `client.artifacts.generate_audio()`, `client.artifacts.wait_for_completion()`, `client.artifacts.download_audio()`).
 - Расширение Trigger.dev для Python: `https://trigger.dev/docs/config/extensions/pythonExtension` (`pythonExtension({ scripts, requirementsFile })`, `python.runScript()`).
@@ -20,7 +21,13 @@
 
 ## Граница этого плана
 
-Этот план дает рабочую версию без браузерного fallback: HTTP-экстрактор получает статьи через `httpx` + `trafilatura/readability`, а `ArticleFallback` уже присутствует как интерфейс. После этого плана выполнить отдельный Playwright-план, чтобы закрыть browser runtime, Playwright preflight и fallback-критерий приемки.
+Этот план дает рабочую версию без извлечения внешних сайтов: пайплайн получает последний дайджест-пост `ciscrypted`, берет из него `https://t.me/.../...` ссылки, читает соответствующие посты других Telegram-каналов через Telethon и добавляет их текст в NotebookLM. `TELEGRAM_SESSION_STRING` должен принадлежать аккаунту, который имеет доступ к связанным каналам. Ссылки, которые не являются публичными ссылками на Telegram-посты или недоступны текущей Telegram-сессии, фиксируются как ошибки извлечения в отчете и Trigger.dev metadata.
+
+## Архитектурное решение по retries и дублям
+
+`notebooklm-py` делает `client.notebooks.create()` retry-safe, но `client.sources.add_text()` не является retry-safe: у текстового источника нет надежного server-side dedupe key. Поэтому план не пытается повторно добавлять текстовые источники в уже частично заполненный блокнот. Если run прервался в статусе `sources_adding`, следующий запуск сначала удаляет частичный блокнот и создает новый. Trade-off: мы платим дополнительным удалением/пересозданием блокнота и возможной ручной очисткой, если удаление недоступно, зато финальный блокнот не получает дубликаты источников.
+
+Для `forceReprocess` используется новый attempt id: обычный run имеет ключ `ciscrypted:YYYY-MM-DD`, а forced run — `ciscrypted:YYYY-MM-DD:force:<uuid>`. `state_store` хранит записи по `idempotency_key`, а текущий активный результат выбирается по `target_date` среди записей, не помеченных `superseded`. При forced run предыдущая активная запись помечается `superseded`, новая становится активной.
 
 ## Структура файлов
 
@@ -38,7 +45,7 @@
 - Создать: `src/digest/url_extractor.py` — извлечение и дедупликация URL.
 - Создать: `src/digest/telegram_reader.py` — выбор дневного Telegram-сообщения.
 - Создать: `src/digest/state_store.py` — durable state interface и PostgreSQL-реализация.
-- Создать: `src/digest/article_extractor.py` — HTTP-first извлечение статей и fallback protocol.
+- Создать: `src/digest/telegram_post_extractor.py` — разбор ссылок `t.me` и извлечение текста связанных Telegram-постов.
 - Создать: `src/digest/run_report.py` — сжатая metadata-проекция для Trigger.dev.
 - Создать: `src/digest/notebook_cleanup.py` — выбор старых NotebookLM-блокнотов для удаления.
 - Создать: `src/digest/notebooklm_client.py` — NotebookLM-адаптер, загрузка источников, Audio Overview, MP3-конвертация.
@@ -105,6 +112,7 @@ def test_env_example_documents_required_digest_variables() -> None:
         "DIGEST_RANDOM_DELAY_MINUTES_MIN",
         "DIGEST_RANDOM_DELAY_MINUTES_MAX",
         "AUDIO_OVERVIEW_TIMEOUT_SECONDS",
+        "TELEGRAM_LINK_LIMIT",
     }
 
     missing = [name for name in sorted(required_names) if f"{name}=" not in env_text]
@@ -116,11 +124,7 @@ def test_trigger_python_requirements_include_digest_dependencies() -> None:
     for package_name in [
         "telethon",
         "notebooklm-py",
-        "trafilatura",
-        "readability-lxml",
         "httpx",
-        "beautifulsoup4",
-        "lxml",
         "psycopg[binary]",
     ]:
         assert package_name in requirements
@@ -145,8 +149,8 @@ def test_trigger_python_requirements_include_digest_dependencies() -> None:
     "test": "vitest run && python -m pytest",
     "test:trigger": "vitest run src/trigger",
     "test:python": "python -m pytest",
-    "trigger:dry-run": "trigger.dev deploy --dry-run",
-    "trigger:deploy": "trigger.dev deploy"
+    "trigger:dry-run": "npx trigger.dev@4.4.6 deploy --dry-run",
+    "trigger:deploy": "npx trigger.dev@4.4.6 deploy"
   },
   "dependencies": {
     "@trigger.dev/python": "4.4.6",
@@ -157,6 +161,7 @@ def test_trigger_python_requirements_include_digest_dependencies() -> None:
     "@trigger.dev/build": "4.4.6",
     "@types/node": "22.13.1",
     "typescript": "5.7.3",
+    "trigger.dev": "4.4.6",
     "vitest": "2.1.8"
   }
 }
@@ -239,9 +244,7 @@ DIGEST_RANDOM_WINDOW_END=04:00
 DIGEST_RANDOM_DELAY_MINUTES_MIN=0
 DIGEST_RANDOM_DELAY_MINUTES_MAX=120
 AUDIO_OVERVIEW_TIMEOUT_SECONDS=1200
-ARTICLE_HTTP_TIMEOUT_SECONDS=30
-ARTICLE_MIN_TEXT_LENGTH=600
-ENABLE_PLAYWRIGHT_FALLBACK=false
+TELEGRAM_LINK_LIMIT=50
 ```
 
 Создать `.gitignore`:
@@ -268,11 +271,7 @@ credentials/
 ```text
 telethon
 notebooklm-py
-trafilatura
-readability-lxml
 httpx
-beautifulsoup4
-lxml
 psycopg[binary]
 pytest
 pytest-asyncio
@@ -354,7 +353,7 @@ def test_settings_from_env_reads_numbers_and_defaults(monkeypatch: pytest.Monkey
     assert settings.telegram_source_channel == "ciscrypted"
     assert settings.digest_timezone == "Europe/Moscow"
     assert settings.notebooklm_cleanup_threshold == 45
-    assert settings.enable_playwright_fallback is False
+    assert settings.telegram_link_limit == 50
 
 
 def test_settings_rejects_missing_required_secret(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -372,25 +371,29 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from digest.models import ArticleStatus, ExtractedArticle, TelegramDigestMessage
+from digest.models import ExtractedTelegramPost, PostStatus, TelegramDigestMessage
 
 
-def test_article_metadata_excludes_full_text() -> None:
-    article = ExtractedArticle(
-        url="https://example.com/a",
+def test_post_metadata_excludes_full_text() -> None:
+    post = ExtractedTelegramPost(
+        url="https://t.me/otherchannel/123",
+        channel="otherchannel",
+        message_id=123,
         title="Заголовок",
-        text="Очень длинный текст статьи",
-        extraction_method="http",
-        status=ArticleStatus.EXTRACTED,
+        text="Очень длинный текст поста",
+        extraction_method="telegram",
+        status=PostStatus.EXTRACTED,
         error=None,
     )
 
-    assert article.to_metadata() == {
-        "url": "https://example.com/a",
+    assert post.to_metadata() == {
+        "url": "https://t.me/otherchannel/123",
+        "channel": "otherchannel",
+        "messageId": 123,
         "title": "Заголовок",
         "status": "extracted",
-        "extractionMethod": "http",
-        "textLength": 24,
+        "extractionMethod": "telegram",
+        "textLength": 25,
         "error": None,
     }
 
@@ -398,9 +401,9 @@ def test_article_metadata_excludes_full_text() -> None:
 def test_digest_message_builds_public_url() -> None:
     message = TelegramDigestMessage(
         message_id=12345,
-        text="https://example.com",
+        text="https://t.me/otherchannel/123",
         published_at=datetime(2026, 6, 25, 21, 10, tzinfo=ZoneInfo("Europe/Moscow")),
-        urls=["https://example.com"],
+        urls=["https://t.me/otherchannel/123"],
     )
 
     assert message.public_url == "https://t.me/ciscrypted/12345"
@@ -425,7 +428,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 
-class ArticleStatus(StrEnum):
+class PostStatus(StrEnum):
     PENDING = "pending"
     EXTRACTING = "extracting"
     EXTRACTED = "extracted"
@@ -450,16 +453,19 @@ class AudioStatus(StrEnum):
 class RunStatus(StrEnum):
     PENDING = "pending"
     NO_DIGEST_MESSAGE = "no_digest_message"
-    NO_VALID_URLS = "no_valid_urls"
-    NOTEBOOK_CREATED = "notebook_created"
-    AUDIO_DOWNLOADED = "audio_downloaded"
-    SENT_TO_TELEGRAM = "sent_to_telegram"
+    NO_VALID_POSTS = "no_valid_posts"
     CLEANUP_REQUIRED = "cleanup_required"
+    NOTEBOOK_CREATED = "notebook_created"
+    SOURCES_ADDING = "sources_adding"
+    SOURCES_ADDED = "sources_added"
+    AUDIO_DOWNLOADED = "audio_downloaded"
+    TELEGRAM_SENDING = "telegram_sending"
+    SENT_TO_TELEGRAM = "sent_to_telegram"
     FAILED = "failed"
     SUPERSEDED = "superseded"
 
 
-ExtractionMethod = Literal["http", "playwright"]
+ExtractionMethod = Literal["telegram"]
 
 
 @dataclass(frozen=True)
@@ -474,13 +480,22 @@ class TelegramDigestMessage:
         return f"https://t.me/ciscrypted/{self.message_id}"
 
 
-@dataclass
-class ExtractedArticle:
+@dataclass(frozen=True)
+class TelegramPostLink:
     url: str
+    channel: str
+    message_id: int
+
+
+@dataclass
+class ExtractedTelegramPost:
+    url: str
+    channel: str
+    message_id: int
     title: str | None
     text: str
     extraction_method: ExtractionMethod
-    status: ArticleStatus
+    status: PostStatus
     error: str | None = None
 
     @property
@@ -490,6 +505,8 @@ class ExtractedArticle:
     def to_metadata(self) -> dict[str, Any]:
         return {
             "url": self.url,
+            "channel": self.channel,
+            "messageId": self.message_id,
             "title": self.title,
             "status": self.status.value,
             "extractionMethod": self.extraction_method,
@@ -509,10 +526,15 @@ class DigestRunState:
     notebook_url: str | None = None
     notebook_name: str | None = None
     notebook_protected: bool = False
+    notebook_source_count: int = 0
+    cleanup_required: bool = False
+    audio_file_path: str | None = None
+    audio_file_size_bytes: int | None = None
     audio_telegram_message_id: int | None = None
-    article_count: int = 0
-    article_error_count: int = 0
+    post_count: int = 0
+    post_error_count: int = 0
     last_error: str | None = None
+    superseded_by: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -580,19 +602,13 @@ def _int_env(name: str, default: int | None = None) -> int:
     return int(value)
 
 
-def _bool_env(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 @dataclass(frozen=True)
 class DigestSettings:
     telegram_api_id: int
     telegram_api_hash: str
     telegram_session_string: str
     telegram_source_channel: str
+    telegram_link_limit: int
     telegram_bot_token: str
     telegram_target_chat_id: str
     notebooklm_auth_json: str
@@ -609,9 +625,6 @@ class DigestSettings:
     random_delay_min_minutes: int
     random_delay_max_minutes: int
     audio_overview_timeout_seconds: int
-    article_http_timeout_seconds: int
-    article_min_text_length: int
-    enable_playwright_fallback: bool
 
     @classmethod
     def from_env(cls) -> "DigestSettings":
@@ -620,6 +633,7 @@ class DigestSettings:
             telegram_api_hash=_required("TELEGRAM_API_HASH"),
             telegram_session_string=_required("TELEGRAM_SESSION_STRING"),
             telegram_source_channel=os.getenv("TELEGRAM_SOURCE_CHANNEL", "ciscrypted"),
+            telegram_link_limit=_int_env("TELEGRAM_LINK_LIMIT", 50),
             telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
             telegram_target_chat_id=_required("TELEGRAM_TARGET_CHAT_ID"),
             notebooklm_auth_json=_required("NOTEBOOKLM_AUTH_JSON"),
@@ -636,9 +650,6 @@ class DigestSettings:
             random_delay_min_minutes=_int_env("DIGEST_RANDOM_DELAY_MINUTES_MIN", 0),
             random_delay_max_minutes=_int_env("DIGEST_RANDOM_DELAY_MINUTES_MAX", 120),
             audio_overview_timeout_seconds=_int_env("AUDIO_OVERVIEW_TIMEOUT_SECONDS", 1200),
-            article_http_timeout_seconds=_int_env("ARTICLE_HTTP_TIMEOUT_SECONDS", 30),
-            article_min_text_length=_int_env("ARTICLE_MIN_TEXT_LENGTH", 600),
-            enable_playwright_fallback=_bool_env("ENABLE_PLAYWRIGHT_FALLBACK", False),
         )
 ```
 
@@ -688,24 +699,24 @@ class Entity:
 
 def test_extract_urls_deduplicates_and_preserves_order() -> None:
     text = (
-        "Первое https://example.com/a, второе https://example.com/b "
-        "и дубль https://example.com/a."
+        "Первое https://t.me/channelone/101, второе https://t.me/channeltwo/202 "
+        "и дубль https://t.me/channelone/101."
     )
 
-    assert extract_urls(text) == ["https://example.com/a", "https://example.com/b"]
+    assert extract_urls(text) == ["https://t.me/channelone/101", "https://t.me/channeltwo/202"]
 
 
 def test_extract_urls_reads_text_url_entities() -> None:
-    text = "Читать статью"
-    entities = [Entity(offset=0, length=13, url="https://example.com/entity")]
+    text = "Читать пост"
+    entities = [Entity(offset=0, length=11, url="https://t.me/channelone/303")]
 
-    assert extract_urls(text, entities=entities) == ["https://example.com/entity"]
+    assert extract_urls(text, entities=entities) == ["https://t.me/channelone/303"]
 
 
 def test_extract_urls_ignores_invalid_schemes() -> None:
-    text = "ftp://example.com https://valid.example/path"
+    text = "ftp://t.me/channelone/101 https://t.me/channelone/101"
 
-    assert extract_urls(text) == ["https://valid.example/path"]
+    assert extract_urls(text) == ["https://t.me/channelone/101"]
 ```
 
 - [ ] **Шаг 2: Написать падающие тесты выбора Telegram-сообщения**
@@ -727,10 +738,10 @@ MSK = ZoneInfo("Europe/Moscow")
 
 def test_select_latest_digest_message_for_target_date() -> None:
     messages = [
-        TelegramDigestMessage(1, "https://old.example", datetime(2026, 6, 25, 9, 0, tzinfo=MSK), ["https://old.example"]),
+        TelegramDigestMessage(1, "https://t.me/oldchannel/10", datetime(2026, 6, 25, 9, 0, tzinfo=MSK), ["https://t.me/oldchannel/10"]),
         TelegramDigestMessage(2, "без ссылок", datetime(2026, 6, 25, 10, 0, tzinfo=MSK), []),
-        TelegramDigestMessage(3, "https://new.example", datetime(2026, 6, 25, 21, 0, tzinfo=MSK), ["https://new.example"]),
-        TelegramDigestMessage(4, "https://tomorrow.example", datetime(2026, 6, 26, 1, 0, tzinfo=MSK), ["https://tomorrow.example"]),
+        TelegramDigestMessage(3, "https://t.me/newchannel/20", datetime(2026, 6, 25, 21, 0, tzinfo=MSK), ["https://t.me/newchannel/20"]),
+        TelegramDigestMessage(4, "https://t.me/tomorrowchannel/30", datetime(2026, 6, 26, 1, 0, tzinfo=MSK), ["https://t.me/tomorrowchannel/30"]),
     ]
 
     selected = select_latest_digest_message(messages, target_date="2026-06-25", timezone_name="Europe/Moscow")
@@ -941,7 +952,7 @@ describe("digest schedule helpers", () => {
 
 - [ ] **Шаг 2: Запустить тесты и убедиться, что они падают**
 
-Команда: `npm run test:trigger -- --runInBand`
+Команда: `npm run test:trigger`
 
 Ожидаемо: FAIL, потому что `digestSchedule.ts` еще не существует.
 
@@ -992,6 +1003,7 @@ export function plannedStartAt(scheduledAt: Date, delayMinutes: number): Date {
 Создать `src/trigger/ciscryptedDigest.ts`:
 
 ```ts
+import { randomUUID } from "node:crypto";
 import { idempotencyKeys, logger, schedules, task } from "@trigger.dev/sdk/v3";
 import { python } from "@trigger.dev/python";
 import {
@@ -1006,6 +1018,7 @@ type ProcessDigestPayload = {
   plannedStartAt: string;
   randomDelayMinutes: number;
   forceReprocess?: boolean;
+  forceAttemptId?: string;
 };
 
 function intEnv(name: string, defaultValue: number): number {
@@ -1034,6 +1047,8 @@ export const processDigestForDate = task({
 
     if (payload.forceReprocess) {
       args.push("--force-reprocess");
+      args.push("--force-attempt-id");
+      args.push(payload.forceAttemptId ?? randomUUID());
     }
 
     const result = await python.runScript("./src/trigger/run_ciscrypted_digest.py", args, {
@@ -1157,9 +1172,25 @@ async def test_get_or_create_run_is_idempotent() -> None:
 async def test_force_reprocess_creates_attempt_key() -> None:
     store = InMemoryStateStore()
 
-    state = await store.get_or_create_run("2026-06-25", "ciscrypted:2026-06-25:force-2")
+    original = await store.get_or_create_run("2026-06-25", "ciscrypted:2026-06-25")
+    forced = await store.get_or_create_run("2026-06-25", "ciscrypted:2026-06-25:force:abc")
 
-    assert state.idempotency_key == "ciscrypted:2026-06-25:force-2"
+    assert forced.idempotency_key == "ciscrypted:2026-06-25:force:abc"
+    superseded = await store.get_run_by_key(original.idempotency_key)
+    assert superseded is not None
+    assert superseded.status == RunStatus.SUPERSEDED
+    assert superseded.superseded_by == forced.idempotency_key
+
+
+@pytest.mark.asyncio
+async def test_lists_protected_notebook_ids() -> None:
+    store = InMemoryStateStore()
+    state = await store.get_or_create_run("2026-06-25", "ciscrypted:2026-06-25")
+    state.notebook_id = "protected-nb"
+    state.notebook_protected = True
+    await store.save_run(state)
+
+    assert await store.list_protected_notebook_ids() == {"protected-nb"}
 ```
 
 Создать `tests/test_run_report.py`:
@@ -1167,30 +1198,32 @@ async def test_force_reprocess_creates_attempt_key() -> None:
 ```python
 from __future__ import annotations
 
-from digest.models import ArticleStatus, CleanupSummary, ExtractedArticle, NotebookInfo, RunStatus
+from digest.models import CleanupSummary, ExtractedTelegramPost, NotebookInfo, PostStatus, RunStatus
 from digest.run_report import build_trigger_metadata
 
 
-def test_metadata_omits_full_article_text() -> None:
-    article = ExtractedArticle(
-        url="https://example.com/a",
+def test_metadata_omits_full_post_text() -> None:
+    post = ExtractedTelegramPost(
+        url="https://t.me/otherchannel/123",
+        channel="otherchannel",
+        message_id=123,
         title="A",
         text="Секретный полный текст",
-        extraction_method="http",
-        status=ArticleStatus.EXTRACTED,
+        extraction_method="telegram",
+        status=PostStatus.EXTRACTED,
     )
 
     metadata = build_trigger_metadata(
         target_date="2026-06-25",
         source_channel="ciscrypted",
         run_status=RunStatus.NOTEBOOK_CREATED,
-        articles=[article],
+        posts=[post],
         notebook=NotebookInfo("nb1", "https://notebooklm.google.com/notebook/nb1", "ciscrypted 2026-06-25", "user@example.com"),
         cleanup=CleanupSummary(45, 5, 40, ["old1"]),
         schedule={"randomDelayMinutes": 77},
     )
 
-    assert metadata["articles"][0]["textLength"] == 20
+    assert metadata["posts"][0]["textLength"] == 22
     assert "Секретный полный текст" not in str(metadata)
 ```
 
@@ -1208,6 +1241,7 @@ def test_metadata_omits_full_article_text() -> None:
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Protocol
@@ -1218,11 +1252,43 @@ from psycopg.rows import dict_row
 from digest.models import DigestRunState, RunStatus
 
 
+TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_table_name(table_name: str) -> str:
+    if not TABLE_NAME_RE.match(table_name):
+        raise ValueError(f"Некорректное имя таблицы state_store: {table_name}")
+    return table_name
+
+
+def _is_force_key(idempotency_key: str) -> bool:
+    return ":force:" in idempotency_key
+
+
+def _new_state(target_date: str, idempotency_key: str) -> DigestRunState:
+    now = datetime.now(timezone.utc)
+    return DigestRunState(
+        target_date=target_date,
+        idempotency_key=idempotency_key,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 class StateStore(Protocol):
     async def ensure_schema(self) -> None:
         ...
 
     async def get_or_create_run(self, target_date: str, idempotency_key: str) -> DigestRunState:
+        ...
+
+    async def get_run_by_key(self, idempotency_key: str) -> DigestRunState | None:
+        ...
+
+    async def get_current_run(self, target_date: str) -> DigestRunState | None:
+        ...
+
+    async def list_protected_notebook_ids(self) -> set[str]:
         ...
 
     async def save_run(self, state: DigestRunState) -> None:
@@ -1231,73 +1297,198 @@ class StateStore(Protocol):
 
 class InMemoryStateStore:
     def __init__(self) -> None:
-        self._runs: dict[str, DigestRunState] = {}
+        self._runs_by_key: dict[str, DigestRunState] = {}
 
     async def ensure_schema(self) -> None:
         return None
 
     async def get_or_create_run(self, target_date: str, idempotency_key: str) -> DigestRunState:
-        if target_date not in self._runs:
-            now = datetime.now(timezone.utc)
-            self._runs[target_date] = DigestRunState(
-                target_date=target_date,
-                idempotency_key=idempotency_key,
-                created_at=now,
-                updated_at=now,
-            )
-        return deepcopy(self._runs[target_date])
+        exact = await self.get_run_by_key(idempotency_key)
+        if exact is not None:
+            return exact
+
+        if _is_force_key(idempotency_key):
+            await self._supersede_active_run(target_date, idempotency_key)
+        else:
+            current = await self.get_current_run(target_date)
+            if current is not None:
+                return current
+
+        state = _new_state(target_date, idempotency_key)
+        self._runs_by_key[idempotency_key] = deepcopy(state)
+        return deepcopy(state)
+
+    async def get_run_by_key(self, idempotency_key: str) -> DigestRunState | None:
+        state = self._runs_by_key.get(idempotency_key)
+        return deepcopy(state) if state is not None else None
+
+    async def get_current_run(self, target_date: str) -> DigestRunState | None:
+        candidates = [
+            state
+            for state in self._runs_by_key.values()
+            if state.target_date == target_date and state.status != RunStatus.SUPERSEDED
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda state: state.created_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return deepcopy(candidates[0])
+
+    async def list_protected_notebook_ids(self) -> set[str]:
+        return {
+            state.notebook_id
+            for state in self._runs_by_key.values()
+            if state.notebook_protected and state.notebook_id
+        }
 
     async def save_run(self, state: DigestRunState) -> None:
         state.updated_at = datetime.now(timezone.utc)
-        self._runs[state.target_date] = deepcopy(state)
+        self._runs_by_key[state.idempotency_key] = deepcopy(state)
+
+    async def _supersede_active_run(self, target_date: str, superseded_by: str) -> None:
+        for key, state in list(self._runs_by_key.items()):
+            if state.target_date == target_date and state.status != RunStatus.SUPERSEDED:
+                state.status = RunStatus.SUPERSEDED
+                state.superseded_by = superseded_by
+                state.updated_at = datetime.now(timezone.utc)
+                self._runs_by_key[key] = deepcopy(state)
 
 
 class PostgresStateStore:
     def __init__(self, database_url: str, table_name: str) -> None:
         self.database_url = database_url
-        self.table_name = table_name
+        self.table_name = _validate_table_name(table_name)
 
     async def ensure_schema(self) -> None:
         query = f"""
         create table if not exists {self.table_name} (
-            target_date text primary key,
+            idempotency_key text primary key,
+            target_date text not null,
+            status text not null,
             state jsonb not null,
             created_at timestamptz not null default now(),
             updated_at timestamptz not null default now()
         )
         """
+        index_query = f"create index if not exists {self.table_name}_target_date_idx on {self.table_name} (target_date)"
         async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
             await conn.execute(query)
+            await conn.execute(index_query)
 
     async def get_or_create_run(self, target_date: str, idempotency_key: str) -> DigestRunState:
         await self.ensure_schema()
-        now = datetime.now(timezone.utc)
-        initial = DigestRunState(
-            target_date=target_date,
-            idempotency_key=idempotency_key,
-            created_at=now,
-            updated_at=now,
-        )
         async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            exact = await self._get_run_by_key(conn, idempotency_key)
+            if exact is not None:
+                return exact
+
+            if _is_force_key(idempotency_key):
+                await self._supersede_active_runs(conn, target_date, idempotency_key)
+            else:
+                current = await self._get_current_run(conn, target_date)
+                if current is not None:
+                    return current
+
+            initial = _new_state(target_date, idempotency_key)
             await conn.execute(
                 f"""
-                insert into {self.table_name} (target_date, state, created_at, updated_at)
-                values (%s, %s, %s, %s)
-                on conflict (target_date) do nothing
+                insert into {self.table_name} (idempotency_key, target_date, status, state, created_at, updated_at)
+                values (%s, %s, %s, %s, %s, %s)
+                on conflict (idempotency_key) do nothing
                 """,
-                (target_date, json.dumps(initial.to_json_dict()), now, now),
+                (
+                    idempotency_key,
+                    target_date,
+                    initial.status.value,
+                    json.dumps(initial.to_json_dict()),
+                    initial.created_at,
+                    initial.updated_at,
+                ),
             )
-            row = await (await conn.execute(f"select state from {self.table_name} where target_date = %s", (target_date,))).fetchone()
-        if row is None:
-            raise RuntimeError(f"state row не найдена для {target_date}")
-        return _state_from_json(row["state"])
+            created = await self._get_run_by_key(conn, idempotency_key)
+            if created is None:
+                raise RuntimeError(f"state row не найдена для {idempotency_key}")
+            return created
+
+    async def get_run_by_key(self, idempotency_key: str) -> DigestRunState | None:
+        await self.ensure_schema()
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            return await self._get_run_by_key(conn, idempotency_key)
+
+    async def get_current_run(self, target_date: str) -> DigestRunState | None:
+        await self.ensure_schema()
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            return await self._get_current_run(conn, target_date)
+
+    async def list_protected_notebook_ids(self) -> set[str]:
+        await self.ensure_schema()
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            rows = await (
+                await conn.execute(f"select state from {self.table_name} where status <> %s", (RunStatus.SUPERSEDED.value,))
+            ).fetchall()
+        protected: set[str] = set()
+        for row in rows:
+            state = _state_from_json(row["state"])
+            if state.notebook_protected and state.notebook_id:
+                protected.add(state.notebook_id)
+        return protected
 
     async def save_run(self, state: DigestRunState) -> None:
         state.updated_at = datetime.now(timezone.utc)
         async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
             await conn.execute(
-                f"update {self.table_name} set state = %s, updated_at = now() where target_date = %s",
-                (json.dumps(state.to_json_dict()), state.target_date),
+                f"""
+                update {self.table_name}
+                set status = %s, state = %s, updated_at = now()
+                where idempotency_key = %s
+                """,
+                (state.status.value, json.dumps(state.to_json_dict()), state.idempotency_key),
+            )
+
+    async def _get_run_by_key(self, conn: psycopg.AsyncConnection, idempotency_key: str) -> DigestRunState | None:
+        row = await (
+            await conn.execute(f"select state from {self.table_name} where idempotency_key = %s", (idempotency_key,))
+        ).fetchone()
+        return _state_from_json(row["state"]) if row is not None else None
+
+    async def _get_current_run(self, conn: psycopg.AsyncConnection, target_date: str) -> DigestRunState | None:
+        row = await (
+            await conn.execute(
+                f"""
+                select state
+                from {self.table_name}
+                where target_date = %s and status <> %s
+                order by created_at desc
+                limit 1
+                """,
+                (target_date, RunStatus.SUPERSEDED.value),
+            )
+        ).fetchone()
+        return _state_from_json(row["state"]) if row is not None else None
+
+    async def _supersede_active_runs(
+        self,
+        conn: psycopg.AsyncConnection,
+        target_date: str,
+        superseded_by: str,
+    ) -> None:
+        rows = await (
+            await conn.execute(
+                f"select state from {self.table_name} where target_date = %s and status <> %s",
+                (target_date, RunStatus.SUPERSEDED.value),
+            )
+        ).fetchall()
+        for row in rows:
+            state = _state_from_json(row["state"])
+            state.status = RunStatus.SUPERSEDED
+            state.superseded_by = superseded_by
+            state.updated_at = datetime.now(timezone.utc)
+            await conn.execute(
+                f"""
+                update {self.table_name}
+                set status = %s, state = %s, updated_at = now()
+                where idempotency_key = %s
+                """,
+                (state.status.value, json.dumps(state.to_json_dict()), state.idempotency_key),
             )
 
 
@@ -1309,22 +1500,30 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 def _state_from_json(data: dict[str, object] | str) -> DigestRunState:
     raw = json.loads(data) if isinstance(data, str) else data
+    def pick(camel: str, snake: str, default: object = None) -> object:
+        return raw[camel] if camel in raw else raw.get(snake, default)
+
     return DigestRunState(
-        target_date=str(raw["targetDate"] if "targetDate" in raw else raw["target_date"]),
-        idempotency_key=str(raw["idempotencyKey"] if "idempotencyKey" in raw else raw["idempotency_key"]),
+        target_date=str(pick("targetDate", "target_date")),
+        idempotency_key=str(pick("idempotencyKey", "idempotency_key")),
         status=RunStatus(str(raw.get("status", RunStatus.PENDING.value))),
-        digest_message_id=raw.get("digestMessageId") or raw.get("digest_message_id"),
-        digest_message_url=raw.get("digestMessageUrl") or raw.get("digest_message_url"),
-        notebook_id=raw.get("notebookId") or raw.get("notebook_id"),
-        notebook_url=raw.get("notebookUrl") or raw.get("notebook_url"),
-        notebook_name=raw.get("notebookName") or raw.get("notebook_name"),
-        notebook_protected=bool(raw.get("notebookProtected") or raw.get("notebook_protected", False)),
-        audio_telegram_message_id=raw.get("audioTelegramMessageId") or raw.get("audio_telegram_message_id"),
-        article_count=int(raw.get("articleCount") or raw.get("article_count") or 0),
-        article_error_count=int(raw.get("articleErrorCount") or raw.get("article_error_count") or 0),
-        last_error=raw.get("lastError") or raw.get("last_error"),
-        created_at=_parse_datetime(raw.get("createdAt") or raw.get("created_at")),
-        updated_at=_parse_datetime(raw.get("updatedAt") or raw.get("updated_at")),
+        digest_message_id=pick("digestMessageId", "digest_message_id"),
+        digest_message_url=pick("digestMessageUrl", "digest_message_url"),
+        notebook_id=pick("notebookId", "notebook_id"),
+        notebook_url=pick("notebookUrl", "notebook_url"),
+        notebook_name=pick("notebookName", "notebook_name"),
+        notebook_protected=bool(pick("notebookProtected", "notebook_protected", False)),
+        notebook_source_count=int(pick("notebookSourceCount", "notebook_source_count", 0) or 0),
+        cleanup_required=bool(pick("cleanupRequired", "cleanup_required", False)),
+        audio_file_path=pick("audioFilePath", "audio_file_path"),
+        audio_file_size_bytes=pick("audioFileSizeBytes", "audio_file_size_bytes"),
+        audio_telegram_message_id=pick("audioTelegramMessageId", "audio_telegram_message_id"),
+        post_count=int(pick("postCount", "post_count", 0) or 0),
+        post_error_count=int(pick("postErrorCount", "post_error_count", 0) or 0),
+        last_error=pick("lastError", "last_error"),
+        superseded_by=pick("supersededBy", "superseded_by"),
+        created_at=_parse_datetime(pick("createdAt", "created_at")),
+        updated_at=_parse_datetime(pick("updatedAt", "updated_at")),
         extra=dict(raw.get("extra") or {}),
     )
 ```
@@ -1338,7 +1537,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from digest.models import CleanupSummary, ExtractedArticle, NotebookInfo, RunStatus
+from digest.models import AudioInfo, CleanupSummary, ExtractedTelegramPost, NotebookInfo, RunStatus, TelegramDigestMessage
 
 
 def build_trigger_metadata(
@@ -1346,22 +1545,32 @@ def build_trigger_metadata(
     target_date: str,
     source_channel: str,
     run_status: RunStatus,
-    articles: list[ExtractedArticle],
+    posts: list[ExtractedTelegramPost],
     notebook: NotebookInfo | None,
     cleanup: CleanupSummary | None,
     schedule: dict[str, Any],
-    max_articles: int = 20,
+    digest_message: TelegramDigestMessage | None = None,
+    audio: AudioInfo | None = None,
+    audio_telegram_message_id: int | None = None,
+    max_posts: int = 50,
 ) -> dict[str, Any]:
-    article_metadata = [article.to_metadata() for article in articles[:max_articles]]
+    post_metadata = [post.to_metadata() for post in posts[:max_posts]]
     metadata: dict[str, Any] = {
         "targetDate": target_date,
         "sourceChannel": source_channel,
         "status": run_status.value,
         "schedule": schedule,
-        "articles": article_metadata,
-        "articleCount": len(articles),
-        "articleErrorCount": sum(1 for article in articles if article.error),
+        "posts": post_metadata,
+        "postCount": len(posts),
+        "postErrorCount": sum(1 for post in posts if post.error),
     }
+    if digest_message:
+        metadata["digestMessage"] = {
+            "telegramMessageId": digest_message.message_id,
+            "publishedAt": digest_message.published_at.isoformat(),
+            "url": digest_message.public_url,
+            "urlCount": len(digest_message.urls),
+        }
     if notebook:
         metadata["notebook"] = {
             "status": "created",
@@ -1369,6 +1578,12 @@ def build_trigger_metadata(
             "url": notebook.url,
             "accountEmail": notebook.account_email,
             "name": notebook.name,
+        }
+    if audio:
+        metadata["audio"] = {
+            "status": "sent_to_telegram" if audio_telegram_message_id else "downloaded",
+            "fileSizeBytes": audio.file_size_bytes,
+            "telegramMessageId": audio_telegram_message_id,
         }
     if cleanup:
         metadata["cleanup"] = {
@@ -1397,85 +1612,98 @@ git commit -m "feat: add durable digest state"
 
 Ожидаемо: коммит проходит; если Git-репозиторий отсутствует, зафиксировать это в отчете и продолжить без коммита.
 
-### Задача 6: HTTP-извлечение статей
+### Задача 6: Извлечение связанных Telegram-постов
 
 **Файлы:**
-- Создать: `src/digest/article_extractor.py`
-- Тест: `tests/test_article_extractor.py`
+- Создать: `src/digest/telegram_post_extractor.py`
+- Тест: `tests/test_telegram_post_extractor.py`
 
-- [ ] **Шаг 1: Написать падающие тесты извлечения статей**
+- [ ] **Шаг 1: Написать падающие тесты разбора и чтения Telegram-постов**
 
-Создать `tests/test_article_extractor.py`:
+Создать `tests/test_telegram_post_extractor.py`:
 
 ```python
 from __future__ import annotations
 
-import httpx
 import pytest
 
-from digest.article_extractor import DisabledBrowserFallback, HttpArticleExtractor, looks_like_js_placeholder
-from digest.models import ArticleStatus
+from digest.models import ExtractedTelegramPost, PostStatus, TelegramPostLink
+from digest.telegram_post_extractor import (
+    TelegramPostExtractor,
+    collect_telegram_post_links,
+    parse_telegram_post_url,
+)
 
 
-def test_detects_js_placeholder() -> None:
-    html = "<html><body><noscript>Please enable JavaScript</noscript><div id='root'></div></body></html>"
+class FakePostClient:
+    def __init__(self, posts: dict[tuple[str, int], str | None]) -> None:
+        self.posts = posts
 
-    assert looks_like_js_placeholder(html) is True
+    async def get_post_text(self, channel: str, message_id: int) -> str | None:
+        return self.posts.get((channel, message_id))
+
+
+def test_parse_public_telegram_post_url() -> None:
+    link = parse_telegram_post_url("https://t.me/otherchannel/123?single")
+
+    assert link == TelegramPostLink(
+        url="https://t.me/otherchannel/123",
+        channel="otherchannel",
+        message_id=123,
+    )
+
+
+def test_collect_links_reports_unsupported_urls_and_deduplicates() -> None:
+    items = collect_telegram_post_links(
+        [
+            "https://t.me/otherchannel/123",
+            "https://example.com/not-telegram",
+            "https://t.me/otherchannel/123",
+            "https://t.me/c/123456/789",
+        ],
+        limit=50,
+    )
+
+    assert items[0] == TelegramPostLink("https://t.me/otherchannel/123", "otherchannel", 123)
+    assert isinstance(items[1], ExtractedTelegramPost)
+    assert items[1].status == PostStatus.FAILED_EXTRACTION
+    assert items[1].error == "ссылка не является публичным Telegram-постом"
+    assert isinstance(items[2], ExtractedTelegramPost)
 
 
 @pytest.mark.asyncio
-async def test_http_extractor_returns_extracted_article() -> None:
-    html = """
-    <html>
-      <head><title>Тестовая статья</title></head>
-      <body><article><p>Первый абзац.</p><p>Второй абзац с достаточным текстом для проверки.</p></article></body>
-    </html>
-    """
+async def test_extracts_linked_telegram_post_text() -> None:
+    client = FakePostClient({("otherchannel", 123): "Заголовок поста\n\nПолный текст новости из Telegram."})
+    extractor = TelegramPostExtractor(client=client)
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=html)
+    post = await extractor.extract(TelegramPostLink("https://t.me/otherchannel/123", "otherchannel", 123))
 
-    extractor = HttpArticleExtractor(
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        min_text_length=20,
-        fallback=DisabledBrowserFallback(),
-    )
-
-    article = await extractor.extract("https://example.com/article")
-
-    assert article.status == ArticleStatus.EXTRACTED
-    assert article.extraction_method == "http"
-    assert article.title == "Тестовая статья"
-    assert "Второй абзац" in article.text
+    assert post.status == PostStatus.EXTRACTED
+    assert post.extraction_method == "telegram"
+    assert post.title == "Заголовок поста"
+    assert "Полный текст новости" in post.text
 
 
 @pytest.mark.asyncio
-async def test_http_extractor_reports_failure_without_browser_fallback() -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="<html><body><div id='root'></div><script src='/app.js'></script></body></html>")
+async def test_reports_missing_or_empty_telegram_post() -> None:
+    client = FakePostClient({("otherchannel", 123): None})
+    extractor = TelegramPostExtractor(client=client)
 
-    extractor = HttpArticleExtractor(
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        min_text_length=100,
-        fallback=DisabledBrowserFallback(),
-    )
+    post = await extractor.extract(TelegramPostLink("https://t.me/otherchannel/123", "otherchannel", 123))
 
-    article = await extractor.extract("https://example.com/js")
-
-    assert article.status == ArticleStatus.FAILED_EXTRACTION
-    assert article.extraction_method == "playwright"
-    assert article.error == "playwright fallback отключен"
+    assert post.status == PostStatus.FAILED_EXTRACTION
+    assert post.error == "Telegram-пост пустой или недоступен"
 ```
 
 - [ ] **Шаг 2: Запустить тесты и убедиться, что они падают**
 
-Команда: `python -m pytest tests/test_article_extractor.py -v`
+Команда: `python -m pytest tests/test_telegram_post_extractor.py -v`
 
-Ожидаемо: FAIL, потому что `digest.article_extractor` еще не существует.
+Ожидаемо: FAIL, потому что `digest.telegram_post_extractor` еще не существует.
 
-- [ ] **Шаг 3: Реализовать HTTP-экстрактор статей**
+- [ ] **Шаг 3: Реализовать разбор ссылок и Telethon-извлечение постов**
 
-Создать `src/digest/article_extractor.py`:
+Создать `src/digest/telegram_post_extractor.py`:
 
 ```python
 from __future__ import annotations
@@ -1483,111 +1711,145 @@ from __future__ import annotations
 import re
 from typing import Protocol
 
-import httpx
-import trafilatura
-from bs4 import BeautifulSoup
-from readability import Document
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
-from digest.models import ArticleStatus, ExtractedArticle
+from digest.models import ExtractedTelegramPost, PostStatus, TelegramPostLink
 
 
-JS_PLACEHOLDER_RE = re.compile(r"(enable javascript|please enable js|id=[\"']root[\"']|window\.__)", re.IGNORECASE)
+TELEGRAM_POST_RE = re.compile(
+    r"^https?://t\.me/(?:s/)?(?P<channel>[A-Za-z0-9_]+)/(?P<message_id>\d+)(?:[?#].*)?$",
+    re.IGNORECASE,
+)
 
 
-class ArticleFallback(Protocol):
-    async def extract(self, url: str) -> ExtractedArticle:
+class TelegramPostClient(Protocol):
+    async def get_post_text(self, channel: str, message_id: int) -> str | None:
         ...
 
 
-class DisabledBrowserFallback:
-    async def extract(self, url: str) -> ExtractedArticle:
-        return ExtractedArticle(
-            url=url,
-            title=None,
-            text="",
-            extraction_method="playwright",
-            status=ArticleStatus.FAILED_EXTRACTION,
-            error="playwright fallback отключен",
-        )
+def _failed_post(url: str, error: str) -> ExtractedTelegramPost:
+    return ExtractedTelegramPost(
+        url=url,
+        channel="",
+        message_id=0,
+        title=None,
+        text="",
+        extraction_method="telegram",
+        status=PostStatus.FAILED_EXTRACTION,
+        error=error,
+    )
 
 
-def looks_like_js_placeholder(html: str) -> bool:
-    if not html.strip():
-        return True
-    return bool(JS_PLACEHOLDER_RE.search(html)) and len(BeautifulSoup(html, "lxml").get_text(" ", strip=True)) < 300
+def parse_telegram_post_url(url: str) -> TelegramPostLink | None:
+    match = TELEGRAM_POST_RE.match(url)
+    if not match:
+        return None
+    channel = match.group("channel")
+    message_id = int(match.group("message_id"))
+    return TelegramPostLink(
+        url=f"https://t.me/{channel}/{message_id}",
+        channel=channel,
+        message_id=message_id,
+    )
 
 
-def _extract_title(html: str) -> str | None:
-    soup = BeautifulSoup(html, "lxml")
-    if soup.title and soup.title.string:
-        return soup.title.string.strip()
-    h1 = soup.find("h1")
-    return h1.get_text(" ", strip=True) if h1 else None
+def collect_telegram_post_links(urls: list[str], *, limit: int) -> list[TelegramPostLink | ExtractedTelegramPost]:
+    items: list[TelegramPostLink | ExtractedTelegramPost] = []
+    seen_posts: set[tuple[str, int]] = set()
+    seen_urls: set[str] = set()
+
+    for url in urls[:limit]:
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        link = parse_telegram_post_url(url)
+        if link is None:
+            items.append(_failed_post(url, "ссылка не является публичным Telegram-постом"))
+            continue
+        key = (link.channel.lower(), link.message_id)
+        if key in seen_posts:
+            continue
+        seen_posts.add(key)
+        items.append(link)
+    return items
 
 
-def _extract_text_with_readability(html: str) -> str:
-    document = Document(html)
-    summary_html = document.summary(html_partial=True)
-    soup = BeautifulSoup(summary_html, "lxml")
-    return soup.get_text("\n", strip=True)
+def _title_from_text(text: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:120]
+    return None
 
 
-def _extract_text(html: str, url: str) -> str:
-    extracted = trafilatura.extract(html, url=url, include_comments=False, include_tables=False)
-    if extracted:
-        return extracted.strip()
-    return _extract_text_with_readability(html).strip()
-
-
-class HttpArticleExtractor:
-    def __init__(
-        self,
-        *,
-        client: httpx.AsyncClient,
-        min_text_length: int,
-        fallback: ArticleFallback,
-    ) -> None:
+class TelegramPostExtractor:
+    def __init__(self, *, client: TelegramPostClient) -> None:
         self.client = client
-        self.min_text_length = min_text_length
-        self.fallback = fallback
 
-    async def extract(self, url: str) -> ExtractedArticle:
+    async def extract(self, link: TelegramPostLink) -> ExtractedTelegramPost:
         try:
-            response = await self.client.get(url, follow_redirects=True)
-            response.raise_for_status()
-            html = response.text
-            if looks_like_js_placeholder(html):
-                return await self.fallback.extract(url)
-            text = _extract_text(html, url)
-            if len(text) < self.min_text_length:
-                return await self.fallback.extract(url)
-            return ExtractedArticle(
-                url=url,
-                title=_extract_title(html),
-                text=text,
-                extraction_method="http",
-                status=ArticleStatus.EXTRACTED,
+            text = await self.client.get_post_text(link.channel, link.message_id)
+            if not text or not text.strip():
+                return _failed_post(link.url, "Telegram-пост пустой или недоступен")
+            return ExtractedTelegramPost(
+                url=link.url,
+                channel=link.channel,
+                message_id=link.message_id,
+                title=_title_from_text(text),
+                text=text.strip(),
+                extraction_method="telegram",
+                status=PostStatus.EXTRACTED,
             )
         except Exception as exc:
-            fallback_result = await self.fallback.extract(url)
-            if fallback_result.status == ArticleStatus.FAILED_EXTRACTION and fallback_result.error == "playwright fallback отключен":
-                fallback_result.error = f"HTTP-извлечение завершилось ошибкой: {exc}"
-            return fallback_result
+            return _failed_post(link.url, f"Не удалось прочитать Telegram-пост: {exc}")
+
+
+class TelethonPostClient:
+    def __init__(self, client: TelegramClient) -> None:
+        self.client = client
+
+    async def get_post_text(self, channel: str, message_id: int) -> str | None:
+        message = await self.client.get_messages(channel, ids=message_id)
+        if message is None:
+            return None
+        return message.message or getattr(message, "text", None)
+
+
+async def fetch_linked_telegram_posts(
+    *,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    urls: list[str],
+    limit: int,
+) -> list[ExtractedTelegramPost]:
+    items = collect_telegram_post_links(urls, limit=limit)
+    posts: list[ExtractedTelegramPost] = []
+
+    async with TelegramClient(StringSession(session_string), api_id, api_hash) as client:
+        extractor = TelegramPostExtractor(client=TelethonPostClient(client))
+        for item in items:
+            if isinstance(item, ExtractedTelegramPost):
+                posts.append(item)
+            else:
+                posts.append(await extractor.extract(item))
+    return posts
 ```
 
 - [ ] **Шаг 4: Запустить тесты и убедиться, что они проходят**
 
-Команда: `python -m pytest tests/test_article_extractor.py -v`
+Команда: `python -m pytest tests/test_telegram_post_extractor.py -v`
 
 Ожидаемо: PASS.
 
-- [ ] **Шаг 5: Закоммитить извлечение статей**
+- [ ] **Шаг 5: Закоммитить извлечение Telegram-постов**
 
 Команда:
 
 ```powershell
-git add src/digest/article_extractor.py tests/test_article_extractor.py
-git commit -m "feat: add HTTP article extraction"
+git add src/digest/telegram_post_extractor.py tests/test_telegram_post_extractor.py
+git commit -m "feat: extract linked Telegram posts"
 ```
 
 Ожидаемо: коммит проходит; если Git-репозиторий отсутствует, зафиксировать это в отчете и продолжить без коммита.
@@ -1650,14 +1912,14 @@ from digest.notebooklm_client import build_source_content, ensure_mp3_path
 
 def test_build_source_content_contains_required_fields() -> None:
     content = build_source_content(
-        title="Статья",
-        url="https://example.com/a",
+        title="Telegram-пост",
+        url="https://t.me/otherchannel/123",
         target_date="2026-06-25",
         text="Полный текст",
     )
 
-    assert "Заголовок: Статья" in content
-    assert "URL: https://example.com/a" in content
+    assert "Заголовок: Telegram-пост" in content
+    assert "Источник Telegram: https://t.me/otherchannel/123" in content
     assert "Дата дайджеста: 2026-06-25" in content
     assert "Полный текст" in content
 
@@ -1683,7 +1945,7 @@ def test_ensure_mp3_path_keeps_existing_mp3(tmp_path: Path) -> None:
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
 from typing import Protocol
 
 
@@ -1745,7 +2007,7 @@ from pathlib import Path
 
 from notebooklm import AudioFormat, AudioLength, NotebookLMClient
 
-from digest.models import AudioInfo, CleanupSummary, ExtractedArticle, NotebookInfo
+from digest.models import AudioInfo, CleanupSummary, ExtractedTelegramPost, NotebookInfo
 from digest.notebook_cleanup import select_notebooks_to_delete
 
 
@@ -1754,7 +2016,7 @@ def build_source_content(*, title: str | None, url: str, target_date: str, text:
     return "\n".join(
         [
             f"Заголовок: {display_title}",
-            f"URL: {url}",
+            f"Источник Telegram: {url}",
             f"Дата дайджеста: {target_date}",
             "",
             text,
@@ -1789,13 +2051,20 @@ class NotebookLmDigestClient:
         keep_recent_days: int,
         cleanup_threshold: int,
         cleanup_target: int,
+        max_notebooks: int,
         today: str,
     ) -> CleanupSummary:
         async with NotebookLMClient.from_storage() as client:
             notebooks = await client.notebooks.list()
             ciscrypted_count = sum(1 for notebook in notebooks if notebook.title.startswith("ciscrypted "))
             if ciscrypted_count < cleanup_threshold:
-                return CleanupSummary(ciscrypted_count, 0, ciscrypted_count, [])
+                return CleanupSummary(
+                    ciscrypted_count,
+                    0,
+                    ciscrypted_count,
+                    [],
+                    cleanup_required=ciscrypted_count >= max_notebooks,
+                )
             selected = select_notebooks_to_delete(
                 notebooks,
                 current_target_date=current_target_date,
@@ -1806,44 +2075,69 @@ class NotebookLmDigestClient:
             )
             deleted_ids: list[str] = []
             for notebook in selected:
-                await client.notebooks.delete(notebook.id)
-                deleted_ids.append(notebook.id)
+                try:
+                    await client.notebooks.delete(notebook.id)
+                    deleted_ids.append(notebook.id)
+                except Exception:
+                    continue
+            count_after = ciscrypted_count - len(deleted_ids)
             return CleanupSummary(
                 notebook_count_before=ciscrypted_count,
                 deleted_notebook_count=len(deleted_ids),
-                notebook_count_after=ciscrypted_count - len(deleted_ids),
+                notebook_count_after=count_after,
                 deleted_notebook_ids=deleted_ids,
+                cleanup_required=count_after >= max_notebooks,
             )
 
-    async def create_notebook_with_articles(
-        self,
-        *,
-        target_date: str,
-        articles: list[ExtractedArticle],
-        extraction_errors: list[ExtractedArticle],
-    ) -> NotebookInfo:
+    async def create_notebook(self, *, target_date: str) -> NotebookInfo:
         notebook_name = f"ciscrypted {target_date}"
         async with NotebookLMClient.from_storage() as client:
             notebook = await client.notebooks.create(notebook_name)
-            for article in articles:
+            notebook_url = await client.notebooks.get_share_url(notebook.id)
+            return NotebookInfo(notebook.id, notebook_url, notebook_name, self.account_email)
+
+    async def delete_notebook(self, notebook_id: str) -> None:
+        async with NotebookLMClient.from_storage() as client:
+            await client.notebooks.delete(notebook_id)
+
+    async def add_posts_to_notebook(
+        self,
+        *,
+        notebook_id: str,
+        target_date: str,
+        posts: list[ExtractedTelegramPost],
+        extraction_errors: list[ExtractedTelegramPost],
+    ) -> int:
+        added_count = 0
+        async with NotebookLMClient.from_storage() as client:
+            for post in posts:
                 content = build_source_content(
-                    title=article.title,
-                    url=article.url,
+                    title=post.title,
+                    url=post.url,
                     target_date=target_date,
-                    text=article.text,
+                    text=post.text,
                 )
-                await client.sources.add_text(notebook.id, article.title or article.url, content, wait=True, wait_timeout=120)
-            if extraction_errors:
-                error_lines = [f"- {article.url}: {article.error}" for article in extraction_errors]
                 await client.sources.add_text(
-                    notebook.id,
-                    "Ошибки извлечения",
-                    "\n".join(error_lines),
+                    notebook_id,
+                    post.title or post.url,
+                    content,
+                    idempotent=True,
                     wait=True,
                     wait_timeout=120,
                 )
-            notebook_url = await client.notebooks.get_share_url(notebook.id)
-            return NotebookInfo(notebook.id, notebook_url, notebook_name, self.account_email)
+                added_count += 1
+            if extraction_errors:
+                error_lines = [f"- {post.url}: {post.error}" for post in extraction_errors]
+                await client.sources.add_text(
+                    notebook_id,
+                    "Ошибки извлечения",
+                    "\n".join(error_lines),
+                    idempotent=True,
+                    wait=True,
+                    wait_timeout=120,
+                )
+                added_count += 1
+        return added_count
 
     async def generate_and_download_audio(self, notebook_id: str, output_dir: Path) -> AudioInfo:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1953,7 +2247,7 @@ def build_audio_caption(
     return "\n".join(
         [
             f"Дайджест ciscrypted за {html.escape(target_date)}",
-            f"Статьи: {processed_count} обработано, {error_count} с ошибками",
+            f"Посты: {processed_count} обработано, {error_count} с ошибками",
             "",
             f'<a href="{html.escape(digest_message_url, quote=True)}">Оригинальный Telegram-пост</a>',
             f'<a href="{html.escape(notebook_url, quote=True)}">Блокнот NotebookLM [{html.escape(notebook_account_email)}]</a>',
@@ -1989,7 +2283,7 @@ class TelegramBotSender:
         short_caption = caption
         report_to_send = full_report
         if len(caption) > TELEGRAM_AUDIO_CAPTION_LIMIT:
-            short_caption = caption[:1000]
+            short_caption = "\n".join(caption.splitlines()[:2])
             report_to_send = full_report or caption
 
         with audio_path.open("rb") as audio_file:
@@ -2075,6 +2369,14 @@ class FakeTelegramSender:
         return 1
 
 
+class FakeNotebookClient:
+    def __init__(self) -> None:
+        self.deleted_ids: list[str] = []
+
+    async def delete_notebook(self, notebook_id: str) -> None:
+        self.deleted_ids.append(notebook_id)
+
+
 @pytest.mark.asyncio
 async def test_pipeline_stops_before_side_effects_when_run_completed() -> None:
     store = InMemoryStateStore()
@@ -2104,6 +2406,47 @@ async def test_pipeline_notifies_when_digest_missing() -> None:
 
     assert state.status == RunStatus.NO_DIGEST_MESSAGE
     assert sender.messages == ["Дайджест ciscrypted за 2026-06-25 не найден."]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_stops_after_unknown_telegram_audio_send() -> None:
+    store = InMemoryStateStore()
+    sender = FakeTelegramSender()
+    pipeline = DigestPipeline(state_store=store, telegram_sender=sender)
+    state = DigestRunState(
+        target_date="2026-06-25",
+        idempotency_key="ciscrypted:2026-06-25",
+        status=RunStatus.TELEGRAM_SENDING,
+    )
+    await store.save_run(state)
+
+    stopped = await pipeline.stop_after_unknown_telegram_send(state)
+
+    assert stopped.status == RunStatus.CLEANUP_REQUIRED
+    assert stopped.cleanup_required is True
+    assert "могла уже выполниться" in sender.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_deletes_partial_notebook_before_retrying_sources() -> None:
+    store = InMemoryStateStore()
+    sender = FakeTelegramSender()
+    pipeline = DigestPipeline(state_store=store, telegram_sender=sender)
+    notebook_client = FakeNotebookClient()
+    state = DigestRunState(
+        target_date="2026-06-25",
+        idempotency_key="ciscrypted:2026-06-25",
+        status=RunStatus.SOURCES_ADDING,
+        notebook_id="partial-nb",
+        notebook_url="https://notebooklm.google.com/notebook/partial-nb",
+        notebook_name="ciscrypted 2026-06-25",
+    )
+
+    reset = await pipeline.reset_partial_notebook(state=state, notebook_client=notebook_client)
+
+    assert notebook_client.deleted_ids == ["partial-nb"]
+    assert reset.status == RunStatus.PENDING
+    assert reset.notebook_id is None
 ```
 
 - [ ] **Шаг 2: Запустить тесты и убедиться, что они падают**
@@ -2122,6 +2465,8 @@ from __future__ import annotations
 import importlib
 import os
 import shutil
+
+from notebooklm import NotebookLMClient
 
 from digest.config import DigestSettings
 from digest.state_store import PostgresStateStore
@@ -2143,10 +2488,13 @@ def check_required_imports(module_names: list[str]) -> None:
 
 
 async def run_preflight(settings: DigestSettings) -> None:
-    check_required_imports(["telethon", "notebooklm", "httpx", "trafilatura", "bs4", "psycopg"])
+    check_required_imports(["telethon", "notebooklm", "httpx", "psycopg"])
     if shutil.which("ffmpeg") is None:
         raise PreflightError("ffmpeg binary is not available")
     os.environ["NOTEBOOKLM_AUTH_JSON"] = settings.notebooklm_auth_json
+    async with NotebookLMClient.from_storage() as client:
+        await client.refresh_auth()
+        await client.notebooks.list()
     store = PostgresStateStore(settings.state_database_url, settings.digest_state_table)
     await store.ensure_schema()
 ```
@@ -2158,17 +2506,17 @@ async def run_preflight(settings: DigestSettings) -> None:
 ```python
 from __future__ import annotations
 
-import httpx
+from datetime import date
 from pathlib import Path
 from typing import Any
 
-from digest.article_extractor import DisabledBrowserFallback, HttpArticleExtractor
 from digest.config import DigestSettings
-from digest.models import ArticleStatus, DigestRunState, RunStatus
+from digest.models import AudioInfo, CleanupSummary, DigestRunState, NotebookInfo, PostStatus, RunStatus
 from digest.notebooklm_client import NotebookLmDigestClient
 from digest.run_report import build_trigger_metadata
 from digest.state_store import StateStore
 from digest.telegram_bot_sender import TelegramBotSender, build_audio_caption
+from digest.telegram_post_extractor import fetch_linked_telegram_posts
 from digest.telegram_reader import fetch_channel_messages_for_date, select_latest_digest_message
 
 
@@ -2190,6 +2538,66 @@ class DigestPipeline:
         await self.telegram_sender.send_text(f"Дайджест ciscrypted за {target_date} не найден.")
         return state
 
+    async def stop_after_unknown_telegram_send(self, state: DigestRunState) -> DigestRunState:
+        state.status = RunStatus.CLEANUP_REQUIRED
+        state.cleanup_required = True
+        state.last_error = (
+            "Предыдущий запуск прервался во время sendAudio. "
+            "Автоматический повтор остановлен, чтобы не отправить MP3 дважды."
+        )
+        await self.state_store.save_run(state)
+        await self.telegram_sender.send_text(
+            f"Проверьте Telegram вручную: отправка MP3 за {state.target_date} могла уже выполниться."
+        )
+        return state
+
+    async def reset_partial_notebook(
+        self,
+        *,
+        state: DigestRunState,
+        notebook_client: NotebookLmDigestClient,
+    ) -> DigestRunState:
+        if state.status != RunStatus.SOURCES_ADDING:
+            return state
+        if not state.notebook_id:
+            state.status = RunStatus.PENDING
+            await self.state_store.save_run(state)
+            return state
+        try:
+            await notebook_client.delete_notebook(state.notebook_id)
+        except Exception as exc:
+            state.status = RunStatus.CLEANUP_REQUIRED
+            state.cleanup_required = True
+            state.last_error = f"Не удалось удалить частично заполненный NotebookLM-блокнот: {exc}"
+            await self.state_store.save_run(state)
+            await self.telegram_sender.send_text(
+                f"Нужна ручная очистка NotebookLM: частичный блокнот за {state.target_date} не удален."
+            )
+            return state
+        state.notebook_id = None
+        state.notebook_url = None
+        state.notebook_name = None
+        state.notebook_source_count = 0
+        state.status = RunStatus.PENDING
+        await self.state_store.save_run(state)
+        return state
+
+
+def _cleanup_to_metadata(cleanup: CleanupSummary) -> dict[str, Any]:
+    return {
+        "notebookCountBefore": cleanup.notebook_count_before,
+        "deletedNotebookCount": cleanup.deleted_notebook_count,
+        "notebookCountAfter": cleanup.notebook_count_after,
+        "deletedNotebookIds": cleanup.deleted_notebook_ids,
+        "cleanupRequired": cleanup.cleanup_required,
+    }
+
+
+def _notebook_from_state(state: DigestRunState, account_email: str) -> NotebookInfo | None:
+    if not state.notebook_id or not state.notebook_url or not state.notebook_name:
+        return None
+    return NotebookInfo(state.notebook_id, state.notebook_url, state.notebook_name, account_email)
+
 
 async def run_digest_for_date(
     *,
@@ -2199,10 +2607,13 @@ async def run_digest_for_date(
     planned_start_at: str,
     random_delay_minutes: int,
     force_reprocess: bool = False,
+    force_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     idempotency_key = f"ciscrypted:{target_date}"
     if force_reprocess:
-        idempotency_key = f"{idempotency_key}:force"
+        if not force_attempt_id:
+            raise ValueError("force_attempt_id обязателен для force_reprocess")
+        idempotency_key = f"{idempotency_key}:force:{force_attempt_id}"
 
     sender = TelegramBotSender(
         bot_token=settings.telegram_bot_token,
@@ -2214,6 +2625,22 @@ async def run_digest_for_date(
         return completed
 
     state = await state_store.get_or_create_run(target_date, idempotency_key)
+    notebook_client = NotebookLmDigestClient(
+        account_email=settings.notebooklm_account_email,
+        audio_language=settings.notebooklm_audio_language,
+        audio_timeout_seconds=settings.audio_overview_timeout_seconds,
+    )
+
+    if state.status == RunStatus.CLEANUP_REQUIRED:
+        return state.to_json_dict()
+
+    if state.status == RunStatus.TELEGRAM_SENDING and state.audio_telegram_message_id is None:
+        state = await pipeline.stop_after_unknown_telegram_send(state)
+        return state.to_json_dict()
+
+    state = await pipeline.reset_partial_notebook(state=state, notebook_client=notebook_client)
+    if state.status == RunStatus.CLEANUP_REQUIRED:
+        return state.to_json_dict()
 
     messages = await fetch_channel_messages_for_date(
         api_id=settings.telegram_api_id,
@@ -2232,45 +2659,95 @@ async def run_digest_for_date(
     state.digest_message_url = digest_message.public_url
     await state_store.save_run(state)
 
-    async with httpx.AsyncClient(timeout=settings.article_http_timeout_seconds) as client:
-        extractor = HttpArticleExtractor(
-            client=client,
-            min_text_length=settings.article_min_text_length,
-            fallback=DisabledBrowserFallback(),
-        )
-        articles = [await extractor.extract(url) for url in digest_message.urls]
+    posts = await fetch_linked_telegram_posts(
+        api_id=settings.telegram_api_id,
+        api_hash=settings.telegram_api_hash,
+        session_string=settings.telegram_session_string,
+        urls=digest_message.urls,
+        limit=settings.telegram_link_limit,
+    )
 
-    extracted = [article for article in articles if article.status == ArticleStatus.EXTRACTED]
-    errors = [article for article in articles if article.status == ArticleStatus.FAILED_EXTRACTION]
-    state.article_count = len(extracted)
-    state.article_error_count = len(errors)
+    extracted = [post for post in posts if post.status == PostStatus.EXTRACTED]
+    errors = [post for post in posts if post.status == PostStatus.FAILED_EXTRACTION]
+    state.post_count = len(extracted)
+    state.post_error_count = len(errors)
     await state_store.save_run(state)
 
     if not extracted:
-        state.status = RunStatus.NO_VALID_URLS
+        state.status = RunStatus.NO_VALID_POSTS
         await state_store.save_run(state)
-        await sender.send_text(f"В дайджесте ciscrypted за {target_date} нет статей, которые удалось извлечь.")
+        await sender.send_text(f"В дайджесте ciscrypted за {target_date} нет Telegram-постов, которые удалось извлечь.")
         return state.to_json_dict()
 
-    notebook_client = NotebookLmDigestClient(
-        account_email=settings.notebooklm_account_email,
-        audio_language=settings.notebooklm_audio_language,
-        audio_timeout_seconds=settings.audio_overview_timeout_seconds,
-    )
-    notebook = await notebook_client.create_notebook_with_articles(
-        target_date=target_date,
-        articles=extracted,
-        extraction_errors=errors,
-    )
-    state.notebook_id = notebook.id
-    state.notebook_url = notebook.url
-    state.notebook_name = notebook.name
-    state.status = RunStatus.NOTEBOOK_CREATED
-    await state_store.save_run(state)
+    cleanup: CleanupSummary | None = None
+    notebook = _notebook_from_state(state, settings.notebooklm_account_email)
+    if notebook is None:
+        protected_ids = await state_store.list_protected_notebook_ids()
+        cleanup = await notebook_client.cleanup_old_notebooks(
+            current_target_date=target_date,
+            protected_ids=protected_ids,
+            keep_recent_days=settings.notebooklm_keep_recent_days,
+            cleanup_threshold=settings.notebooklm_cleanup_threshold,
+            cleanup_target=settings.notebooklm_cleanup_target,
+            max_notebooks=settings.notebooklm_max_notebooks,
+            today=(date.fromisoformat(target_date) + timedelta(days=1)).isoformat(),
+        )
+        state.extra["cleanup"] = _cleanup_to_metadata(cleanup)
+        if cleanup.cleanup_required:
+            state.status = RunStatus.CLEANUP_REQUIRED
+            state.cleanup_required = True
+            state.last_error = "Достигнут лимит NotebookLM-блокнотов, автоматическая очистка недостаточна"
+            await state_store.save_run(state)
+            await sender.send_text("Нужна ручная очистка NotebookLM: новый блокнот ciscrypted не создан.")
+            return state.to_json_dict()
+        await state_store.save_run(state)
 
-    audio = await notebook_client.generate_and_download_audio(notebook.id, Path("runtime") / target_date)
-    state.status = RunStatus.AUDIO_DOWNLOADED
-    await state_store.save_run(state)
+        notebook = await notebook_client.create_notebook(target_date=target_date)
+        state.notebook_id = notebook.id
+        state.notebook_url = notebook.url
+        state.notebook_name = notebook.name
+        state.status = RunStatus.NOTEBOOK_CREATED
+        await state_store.save_run(state)
+
+    if state.status == RunStatus.NOTEBOOK_CREATED:
+        state.status = RunStatus.SOURCES_ADDING
+        await state_store.save_run(state)
+        try:
+            source_count = await notebook_client.add_posts_to_notebook(
+                notebook_id=notebook.id,
+                target_date=target_date,
+                posts=extracted,
+                extraction_errors=errors,
+            )
+        except Exception as exc:
+            state.last_error = f"Добавление источников в NotebookLM прервано: {exc}"
+            await state_store.save_run(state)
+            raise
+        for post in extracted:
+            post.status = PostStatus.ADDED_TO_NOTEBOOK
+        state.notebook_source_count = source_count
+        state.status = RunStatus.SOURCES_ADDED
+        await state_store.save_run(state)
+
+    for post in extracted:
+        if state.status in {RunStatus.SOURCES_ADDED, RunStatus.AUDIO_DOWNLOADED, RunStatus.SENT_TO_TELEGRAM}:
+            post.status = PostStatus.ADDED_TO_NOTEBOOK
+
+    audio: AudioInfo
+    existing_audio_path = Path(state.audio_file_path) if state.audio_file_path else None
+    if state.status == RunStatus.AUDIO_DOWNLOADED and existing_audio_path and existing_audio_path.exists():
+        audio = AudioInfo(path=str(existing_audio_path), file_size_bytes=state.audio_file_size_bytes or 0)
+    else:
+        audio = await notebook_client.generate_and_download_audio(notebook.id, Path("runtime") / target_date)
+        state.audio_file_path = audio.path
+        state.audio_file_size_bytes = audio.file_size_bytes
+        state.status = RunStatus.AUDIO_DOWNLOADED
+        await state_store.save_run(state)
+
+    if state.audio_telegram_message_id is not None:
+        state.status = RunStatus.SENT_TO_TELEGRAM
+        await state_store.save_run(state)
+        return state.to_json_dict()
 
     caption = build_audio_caption(
         target_date=target_date,
@@ -2280,6 +2757,8 @@ async def run_digest_for_date(
         notebook_url=notebook.url,
         notebook_account_email=notebook.account_email,
     )
+    state.status = RunStatus.TELEGRAM_SENDING
+    await state_store.save_run(state)
     message_id = await sender.send_audio_with_report(audio_path=Path(audio.path), caption=caption)
     state.audio_telegram_message_id = message_id
     state.status = RunStatus.SENT_TO_TELEGRAM
@@ -2289,13 +2768,16 @@ async def run_digest_for_date(
         target_date=target_date,
         source_channel=settings.telegram_source_channel,
         run_status=state.status,
-        articles=articles,
+        posts=posts,
         notebook=notebook,
-        cleanup=None,
+        cleanup=cleanup,
         schedule={
             "plannedStartAt": planned_start_at,
             "randomDelayMinutes": random_delay_minutes,
         },
+        digest_message=digest_message,
+        audio=audio,
+        audio_telegram_message_id=message_id,
     )
 ```
 
@@ -2322,6 +2804,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planned-start-at", required=True)
     parser.add_argument("--random-delay-minutes", required=True, type=int)
     parser.add_argument("--force-reprocess", action="store_true")
+    parser.add_argument("--force-attempt-id")
     return parser.parse_args()
 
 
@@ -2337,6 +2820,7 @@ async def async_main() -> int:
         planned_start_at=args.planned_start_at,
         random_delay_minutes=args.random_delay_minutes,
         force_reprocess=args.force_reprocess,
+        force_attempt_id=args.force_attempt_id,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -2392,7 +2876,7 @@ import os
 from pathlib import Path
 
 from digest.notebooklm_client import NotebookLmDigestClient
-from digest.models import ArticleStatus, ExtractedArticle
+from digest.models import ExtractedTelegramPost, PostStatus
 
 
 async def main() -> int:
@@ -2401,16 +2885,20 @@ async def main() -> int:
         audio_language=os.getenv("NOTEBOOKLM_AUDIO_LANGUAGE", "ru"),
         audio_timeout_seconds=int(os.getenv("AUDIO_OVERVIEW_TIMEOUT_SECONDS", "1200")),
     )
-    article = ExtractedArticle(
-        url="https://example.com/notebooklm-smoke",
+    post = ExtractedTelegramPost(
+        url="https://t.me/notebooklm_smoke/1",
+        channel="notebooklm_smoke",
+        message_id=1,
         title="NotebookLM smoke-тест",
-        text="Это короткий тестовый текст для проверки создания блокнота и Audio Overview.",
-        extraction_method="http",
-        status=ArticleStatus.EXTRACTED,
+        text="Это короткий тестовый текст Telegram-поста для проверки создания блокнота и Audio Overview.",
+        extraction_method="telegram",
+        status=PostStatus.EXTRACTED,
     )
-    notebook = await client.create_notebook_with_articles(
+    notebook = await client.create_notebook(target_date="2099-01-01")
+    await client.add_posts_to_notebook(
+        notebook_id=notebook.id,
         target_date="2099-01-01",
-        articles=[article],
+        posts=[post],
         extraction_errors=[],
     )
     audio = await client.generate_and_download_audio(notebook.id, Path("runtime") / "smoke")
@@ -2458,10 +2946,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import httpx
 
 from digest.config import DigestSettings
-from digest.article_extractor import DisabledBrowserFallback, HttpArticleExtractor
+from digest.telegram_post_extractor import fetch_linked_telegram_posts
 from digest.telegram_reader import fetch_channel_messages_for_date, select_latest_digest_message
 
 
@@ -2486,20 +2973,20 @@ async def main() -> int:
     if digest_message is None:
         print({"targetDate": args.target_date, "status": "no_digest_message"})
         return 0
-    async with httpx.AsyncClient(timeout=settings.article_http_timeout_seconds) as client:
-        extractor = HttpArticleExtractor(
-            client=client,
-            min_text_length=settings.article_min_text_length,
-            fallback=DisabledBrowserFallback(),
-        )
-        articles = [await extractor.extract(url) for url in digest_message.urls]
+    posts = await fetch_linked_telegram_posts(
+        api_id=settings.telegram_api_id,
+        api_hash=settings.telegram_api_hash,
+        session_string=settings.telegram_session_string,
+        urls=digest_message.urls,
+        limit=settings.telegram_link_limit,
+    )
     print(
         {
             "targetDate": args.target_date,
             "digestMessageId": digest_message.message_id,
-            "urlCount": len(digest_message.urls),
-            "extractedCount": sum(1 for article in articles if article.text),
-            "failedCount": sum(1 for article in articles if article.error),
+            "linkCount": len(digest_message.urls),
+            "extractedPostCount": sum(1 for post in posts if post.text),
+            "failedPostCount": sum(1 for post in posts if post.error),
         }
     )
     return 0
@@ -2516,7 +3003,7 @@ if __name__ == "__main__":
 ```markdown
 # Дайджест ciscrypted для Trigger.dev
 
-Ежедневный Trigger.dev-пайплайн для дайджеста `ciscrypted`: Telegram → статьи → NotebookLM Audio Overview → Telegram Bot API.
+Ежедневный Trigger.dev-пайплайн для дайджеста `ciscrypted`: Telegram → связанные Telegram-посты → NotebookLM Audio Overview → Telegram Bot API.
 
 ## Локальная установка
 
@@ -2545,13 +3032,13 @@ npm run trigger:dry-run
 Перед production-деплоем проверить, что в Trigger.dev Production заданы env vars из `.env.example`.
 
 ```powershell
-npx trigger.dev env list --env prod
+npx trigger.dev@4.4.6 env list --env prod
 npm run trigger:deploy
 ```
 
-## Playwright fallback
+## Связанные Telegram-посты
 
-Браузерный fallback вынесен в `docs/superpowers/plans/2026-06-26-playwright-article-fallback.md`. До выполнения этого плана `ENABLE_PLAYWRIGHT_FALLBACK=false`, а статьи, требующие браузера, попадут в отчет как ошибки извлечения.
+Ссылки из дайджеста считаются ссылками на публичные посты в других Telegram-каналах в формате `https://t.me/<channel>/<message_id>`. Внешние сайты не скачиваются. Ссылки другого вида попадут в отчет как ошибки извлечения.
 ```
 
 - [ ] **Шаг 5: Запустить help/import проверки smoke-скриптов**
@@ -2590,9 +3077,10 @@ git commit -m "docs: add digest smoke checks"
 
 ## Самопроверка
 
-- Покрытие спеки: расписание, target date, выбор Telegram-сообщения, извлечение URL, HTTP-извлечение статей, создание NotebookLM, загрузка источников, скачивание аудио, отправка в Telegram, idempotency в state, metadata, env-контракт, preflight и deploy-контракт покрыты. Playwright fallback намеренно вынесен в отдельный план, указанный выше.
+- Покрытие спеки: расписание, target date, выбор Telegram-сообщения, извлечение URL, извлечение связанных Telegram-постов, cleanup NotebookLM, создание NotebookLM, загрузка источников, скачивание аудио, отправка в Telegram, idempotency в state, metadata, env-контракт, preflight и deploy-контракт покрыты.
 - Проверка placeholder-маркеров: запрещенных маркеров из раздела No Placeholders не найдено.
-- Согласованность типов: имена `RunStatus`, `ArticleStatus`, `ExtractedArticle`, `DigestRunState`, `NotebookInfo`, `CleanupSummary`, `build_trigger_metadata()` и `run_digest_for_date()` согласованы между задачами.
+- Согласованность типов: имена `RunStatus`, `PostStatus`, `ExtractedTelegramPost`, `TelegramPostLink`, `DigestRunState`, `NotebookInfo`, `AudioInfo`, `CleanupSummary`, `build_trigger_metadata()` и `run_digest_for_date()` согласованы между задачами.
+- Retry-модель: `client.sources.add_text(..., idempotent=True)` не повторяется вслепую; частичный блокнот удаляется перед повтором, а неизвестная отправка MP3 переводит run в `cleanup_required` для ручной сверки.
 
 План готов и сохранен в `docs/superpowers/plans/2026-06-26-triggerdev-ciscrypted-digest.md`. Два варианта исполнения:
 

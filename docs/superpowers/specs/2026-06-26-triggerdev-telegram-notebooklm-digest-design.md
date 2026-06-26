@@ -6,7 +6,7 @@
 
 ## Цель
 
-Нужна программа для Trigger.dev, которая один раз в день обрабатывает дайджест из Telegram-канала `ciscrypted`, переходит по ссылкам из последнего дневного сообщения, извлекает полный текст статей, загружает материалы в отдельный блокнот NotebookLM, генерирует Audio Overview и отправляет MP3 в личный чат Telegram-бота.
+Нужна программа для Trigger.dev, которая один раз в день обрабатывает дайджест из Telegram-канала `ciscrypted`, берет ссылки из последнего дневного сообщения, читает по ним посты в других Telegram-каналах, загружает тексты этих постов в отдельный блокнот NotebookLM, генерирует Audio Overview и отправляет MP3 в личный чат Telegram-бота.
 
 Правило результата: один день = один блокнот NotebookLM = один MP3-подкаст.
 
@@ -20,7 +20,7 @@
 - Генерация аудио: встроенный NotebookLM Audio Overview через `notebooklm-py`.
 - Отправка результата: Telegram Bot API.
 - Состояние обработки: легковесное постоянное хранилище `state_store`, например PostgreSQL/Supabase/Neon или другой durable SQL/KV backend, доступный из Trigger.dev.
-- Runtime-инструменты: Playwright browser runtime для fallback-извлечения статей и `ffmpeg` для приведения аудио к MP3.
+- Runtime-инструменты: `ffmpeg` для приведения аудио к MP3.
 
 Важно: `notebooklm-py` использует неофициальные/недокументированные механизмы NotebookLM. В спецификации это считается осознанным техническим риском: при изменениях NotebookLM интеграция может потребовать правки.
 
@@ -44,11 +44,11 @@ Python-пайплайн отвечает за:
 - чтение сообщений Telegram через Telethon;
 - выбор дневного дайджест-сообщения;
 - извлечение ссылок;
-- скачивание и очистку полного текста статей;
+- чтение связанных Telegram-постов по ссылкам из дайджеста;
 - чтение и обновление `state_store` перед внешними side effects;
 - циклическую очистку старых NotebookLM-блокнотов перед созданием нового;
 - создание блокнота NotebookLM;
-- загрузку статей в NotebookLM;
+- загрузку текстов Telegram-постов в NotebookLM;
 - запуск и скачивание Audio Overview;
 - отправку MP3 через Telegram Bot API.
 
@@ -58,7 +58,7 @@ Python-пайплайн отвечает за:
 - `processDigestForDate` — обработка конкретной даты с global idempotency key и ограничением параллельности.
 - `telegram_reader` — подключение к `ciscrypted`, поиск последнего сообщения за дату со ссылками.
 - `url_extractor` — извлечение и дедупликация URL с сохранением порядка.
-- `article_extractor` — извлечение текста статей через HTTP-парсер и Playwright fallback.
+- `telegram_post_extractor` — разбор ссылок `t.me` и чтение связанных Telegram-постов через Telethon.
 - `notebooklm_client` — создание блокнота, добавление источников, запуск Audio Overview, скачивание MP3.
 - `notebook_cleanup` — учет блокнотов `ciscrypted`, циклическое удаление старых блокнотов при приближении к лимиту.
 - `telegram_bot_sender` — отправка MP3 и текстовых уведомлений.
@@ -120,29 +120,32 @@ https://t.me/ciscrypted/<telegram_message_id>
 - игнорировать невалидные URL;
 - учитывать ссылки из текста сообщения и, если Telethon их предоставляет, из message entities.
 
-## Извлечение статей
+## Извлечение связанных Telegram-постов
 
-Извлечение работает в два слоя.
+Ссылки из выбранного дайджест-сообщения считаются ссылками на посты в других Telegram-каналах, а не ссылками на внешние сайты.
 
-Первый слой: обычный HTTP-запрос и парсер основного текста статьи, например `trafilatura` или `readability`.
+Поддерживаемый формат ссылок:
 
-Второй слой: Playwright fallback. Он используется, если:
+```text
+https://t.me/<channel>/<message_id>
+```
 
-- HTTP-слой вернул пустой текст;
-- текст слишком короткий;
-- страница похожа на JavaScript-заглушку;
-- HTTP-слой вернул ошибку, но URL потенциально можно открыть браузером.
+Допускается вариант `https://t.me/s/<channel>/<message_id>`, который нормализуется к публичной ссылке `https://t.me/<channel>/<message_id>`.
+
+`TELEGRAM_SESSION_STRING` должен принадлежать аккаунту, который имеет доступ к связанным каналам. Если пост недоступен текущей Telegram-сессии, ссылка считается проблемной, но запуск продолжается.
 
 Для каждой ссылки фиксируется:
 
 - URL;
+- канал;
+- `messageId`;
 - заголовок, если удалось извлечь;
-- метод извлечения: `http` или `playwright`;
+- метод извлечения: `telegram`;
 - длина текста;
 - статус;
 - ошибка, если есть.
 
-Если статью не удалось извлечь полностью, запуск продолжается. Успешные статьи все равно загружаются в NotebookLM, а проблемные ссылки попадают в отчет и Trigger.dev metadata.
+Если Telegram-пост не удалось прочитать, запуск продолжается. Успешно извлеченные посты все равно загружаются в NotebookLM, а проблемные ссылки попадают в отчет и Trigger.dev metadata.
 
 ## Создание NotebookLM-блокнота
 
@@ -160,10 +163,10 @@ ciscrypted YYYY-MM-DD
 ciscrypted 2026-06-25
 ```
 
-В блокнот добавляются успешно извлеченные статьи как отдельные текстовые источники. Каждый источник должен содержать:
+В блокнот добавляются успешно извлеченные Telegram-посты как отдельные текстовые источники. Каждый источник должен содержать:
 
-- заголовок статьи;
-- оригинальный URL статьи;
+- заголовок поста;
+- оригинальную ссылку на Telegram-пост;
 - дату дайджеста;
 - полный извлеченный текст.
 
@@ -229,7 +232,7 @@ NOTEBOOKLM_KEEP_RECENT_DAYS=7
 
 ```text
 Дайджест ciscrypted за 2026-06-25
-Статьи: 10 обработано, 2 с ошибками
+Посты: 10 обработано, 2 с ошибками
 
 Оригинальный Telegram-пост
 Блокнот NotebookLM [nicolaibaskow@gmail.com]
@@ -247,7 +250,7 @@ NOTEBOOKLM_KEEP_RECENT_DAYS=7
 
 ```html
 Дайджест ciscrypted за 2026-06-25
-Статьи: 10 обработано, 2 с ошибками
+Посты: 10 обработано, 2 с ошибками
 
 <a href="https://t.me/ciscrypted/12345">Оригинальный Telegram-пост</a>
 <a href="https://notebooklm.google.com/notebook/...">Блокнот NotebookLM [nicolaibaskow@gmail.com]</a>
@@ -257,7 +260,7 @@ NOTEBOOKLM_KEEP_RECENT_DAYS=7
 
 ## Состояние и наблюдаемость в Trigger.dev
 
-В MVP не хранится постоянный архив полных текстов статей и MP3. Полные материалы живут во внешних системах: блокнот в NotebookLM и MP3 в Telegram.
+В MVP не хранится постоянный архив полных текстов Telegram-постов и MP3. Полные материалы живут во внешних системах: блокнот в NotebookLM и MP3 в Telegram.
 
 При этом операционное состояние обязательно хранится в `state_store`. Trigger.dev metadata является только краткой проекцией для run logs и dashboard, а не источником истины для повторов.
 
@@ -275,8 +278,8 @@ NOTEBOOKLM_KEEP_RECENT_DAYS=7
   "notebookName": "ciscrypted 2026-06-25",
   "notebookProtected": false,
   "audioTelegramMessageId": 98765,
-  "articleCount": 12,
-  "articleErrorCount": 2,
+  "postCount": 12,
+  "postErrorCount": 2,
   "lastError": null,
   "createdAt": "2026-06-26T03:17:00+03:00",
   "updatedAt": "2026-06-26T03:58:00+03:00"
@@ -310,22 +313,26 @@ Trigger.dev metadata должна включать короткий снимок
     "url": "https://t.me/ciscrypted/12345",
     "urlCount": 12
   },
-  "articles": [
+  "posts": [
     {
-      "url": "https://example.com/article",
-      "title": "Название статьи",
+      "url": "https://t.me/otherchannel/123",
+      "channel": "otherchannel",
+      "messageId": 123,
+      "title": "Название поста",
       "status": "added_to_notebook",
-      "extractionMethod": "http",
+      "extractionMethod": "telegram",
       "textLength": 18420,
       "error": null
     },
     {
-      "url": "https://example.com/broken",
+      "url": "https://example.com/not-telegram",
+      "channel": "",
+      "messageId": 0,
       "title": null,
       "status": "failed_extraction",
-      "extractionMethod": "playwright",
+      "extractionMethod": "telegram",
       "textLength": 0,
-      "error": "timeout"
+      "error": "ссылка не является публичным Telegram-постом"
     }
   ],
   "notebook": {
@@ -348,7 +355,7 @@ Trigger.dev metadata должна включать короткий снимок
 }
 ```
 
-Статусы статей:
+Статусы Telegram-постов:
 
 - `pending`;
 - `extracting`;
@@ -370,7 +377,7 @@ Trigger.dev metadata должна включать короткий снимок
 - `sent_to_telegram`;
 - `failed`.
 
-Trigger.dev metadata не должна содержать полные тексты статей, полные списки больших ошибок и большие HTML-фрагменты. Если список ссылок слишком большой, metadata хранит только счетчики и первые несколько ошибок, а полный отчет отправляется отдельным текстовым сообщением в Telegram или сохраняется в `state_store` в сжатом виде.
+Trigger.dev metadata не должна содержать полные тексты Telegram-постов и полные списки больших ошибок. Если список ссылок слишком большой, metadata хранит только счетчики и первые несколько ошибок, а полный отчет отправляется отдельным текстовым сообщением в Telegram или сохраняется в `state_store` в сжатом виде.
 
 ## Idempotency и повторы
 
@@ -408,9 +415,9 @@ Trade-off: `state_store` добавляет одну внешнюю зависи
    - MP3 не создается.
    - Бот отправляет текстовый отчет.
 
-3. Часть статей не извлечена.
+3. Часть Telegram-постов не извлечена.
    - Запуск продолжается.
-   - Успешные статьи добавляются в NotebookLM.
+   - Успешные посты добавляются в NotebookLM.
    - Проблемные ссылки видны в metadata и отчете.
 
 4. NotebookLM недоступен или `notebooklm-py` сломался.
@@ -435,9 +442,9 @@ Trade-off: `state_store` добавляет одну внешнюю зависи
    - Бот отправляет уведомление о необходимости ручной очистки NotebookLM.
    - В `state_store` фиксируется статус `cleanup_required`.
 
-9. В runtime Trigger.dev отсутствует Playwright browser runtime или `ffmpeg`.
+9. В runtime Trigger.dev отсутствует `ffmpeg`.
    - Task завершается на preflight-проверке до чтения Telegram и создания NotebookLM.
-   - Ошибка фиксируется как ошибка деплой-контракта, а не как ошибка конкретной статьи.
+   - Ошибка фиксируется как ошибка деплой-контракта, а не как ошибка конкретного поста.
 
 ## Секреты и конфигурация
 
@@ -479,7 +486,7 @@ AUDIO_OVERVIEW_TARGET_MINUTES=15-20
 
 `NOTEBOOKLM_AUTH` является абстрактным именем для учетных данных NotebookLM. Конкретный формат зависит от версии и требований `notebooklm-py`. Реализация должна включать отдельный setup-скрипт или инструкцию для получения и проверки этих учетных данных до деплоя.
 
-`STATE_DATABASE_URL` является секретом. В `state_store` нельзя хранить полные тексты статей, MP3, cookies, Telegram session string или учетные данные NotebookLM.
+`STATE_DATABASE_URL` является секретом. В `state_store` нельзя хранить полные тексты Telegram-постов, MP3, cookies, Telegram session string или учетные данные NotebookLM.
 
 ## Runtime и деплой-контракт Trigger.dev
 
@@ -490,25 +497,20 @@ AUDIO_OVERVIEW_TARGET_MINUTES=15-20
 - TypeScript task лежат в `src/trigger` и экспортируются из файлов, которые попадают в `dirs`;
 - Python-пайплайн попадает в `pythonExtension` через `scripts: ["./src/**/*.py"]` или эквивалент текущего проекта;
 - Python-зависимости добавлены в `pythonExtension({ requirements: [...] })` или requirements-файл, который реально читает Trigger.dev build;
-- Playwright fallback использует Trigger.dev Playwright extension и устанавливает Chromium/runtime-браузер во время build;
 - конвертация аудио использует установленный binary `ffmpeg` через Trigger.dev `ffmpeg` extension или `aptGet`/system packages;
-- `maxDuration` processor task покрывает худший случай: извлечение статей, загрузку в NotebookLM, ожидание Audio Overview, скачивание и конвертацию MP3;
-- preflight-шаг проверяет доступность `ffmpeg`, импорт Python-зависимостей, auth NotebookLM, подключение к `state_store` и возможность запустить Playwright browser.
+- `maxDuration` processor task покрывает худший случай: чтение связанных Telegram-постов, загрузку в NotebookLM, ожидание Audio Overview, скачивание и конвертацию MP3;
+- preflight-шаг проверяет доступность `ffmpeg`, импорт Python-зависимостей, auth NotebookLM и подключение к `state_store`.
 
 Минимальные Python-зависимости:
 
 ```text
 telethon
 notebooklm-py
-trafilatura
-readability-lxml
-playwright
 httpx
-beautifulsoup4
-lxml
+psycopg[binary]
 ```
 
-Если выбран другой HTTP-парсер или другой NotebookLM-клиент, список зависимостей обновляется в спецификации и в `trigger.config.ts` одновременно.
+Если выбран другой NotebookLM-клиент или backend состояния, список зависимостей обновляется в спецификации и в `trigger.config.ts` одновременно.
 
 ## Тестирование
 
@@ -520,7 +522,7 @@ Unit-тесты:
 - расчет `targetDate` по `Europe/Moscow`;
 - формирование HTML-подписи Telegram;
 - формирование Trigger.dev metadata;
-- обновление статусов статей;
+- обновление статусов Telegram-постов;
 - расчет случайной задержки запуска внутри окна `02:00-04:00 Europe/Moscow`;
 - формирование global idempotency key `ciscrypted:YYYY-MM-DD`;
 - переходы состояния в `state_store` без повторных side effects;
@@ -531,7 +533,7 @@ Integration dry-run:
 - подключиться к `ciscrypted`;
 - найти дайджест за указанную дату;
 - извлечь ссылки;
-- скачать тексты статей;
+- прочитать тексты связанных Telegram-постов;
 - не создавать NotebookLM-блокнот;
 - не отправлять MP3.
 
@@ -556,7 +558,7 @@ Trigger.dev staging run:
 - повторный запуск той же даты не создает второй блокнот и не отправляет второй MP3;
 - проверка, что scheduled wrapper планирует обработку внутри окна `02:00-04:00 Europe/Moscow`;
 - проверка статусов успешных и проблемных ссылок;
-- проверка preflight для Python-зависимостей, Playwright, `ffmpeg` и `state_store`;
+- проверка preflight для Python-зависимостей, `ffmpeg` и `state_store`;
 - проверка NotebookLM cleanup на тестовых блокнотах или dry-run cleanup mode.
 
 ## Критерии приемки
@@ -565,17 +567,17 @@ MVP считается готовым, если ручной запуск Trigge
 
 1. Находит последнее сообщение со ссылками в `ciscrypted` за целевую дату.
 2. Извлекает ссылки без дублей и в исходном порядке.
-3. Получает полный текст доступных статей.
+3. Получает полный текст доступных Telegram-постов.
 4. Не останавливается из-за отдельных проблемных ссылок.
 5. Создает один блокнот NotebookLM с названием `ciscrypted YYYY-MM-DD`.
-6. Добавляет все успешно извлеченные статьи в блокнот.
+6. Добавляет все успешно извлеченные Telegram-посты в блокнот.
 7. Генерирует Audio Overview через NotebookLM.
 8. Скачивает MP3.
 9. Отправляет MP3 в личный чат через Telegram Bot API.
 10. Отправляет подпись в согласованном формате с кликабельным оригинальным постом и кликабельным блокнотом NotebookLM.
 11. Показывает в Trigger.dev metadata, какие ссылки обработаны и какие не обработаны.
 12. Записывает durable state по `targetDate` и не дублирует блокнот/MP3 при повторном запуске той же даты.
-13. Выполняет preflight runtime-зависимостей Trigger.dev: Python requirements, Playwright browser runtime, `ffmpeg`, NotebookLM auth и `state_store`.
+13. Выполняет preflight runtime-зависимостей Trigger.dev: Python requirements, `ffmpeg`, NotebookLM auth и `state_store`.
 14. При количестве NotebookLM-блокнотов `ciscrypted` от `NOTEBOOKLM_CLEANUP_THRESHOLD` удаляет старые блокноты до `NOTEBOOKLM_CLEANUP_TARGET` или останавливается с понятным уведомлением, если удаление невозможно.
 
 ## Ограничения MVP
@@ -585,5 +587,5 @@ MVP считается готовым, если ручной запуск Trigge
 - Нет постоянного собственного архива полных текстов и MP3.
 - Нет интерактивных команд Telegram-бота.
 - Нет внешнего TTS.
-- Есть только легковесное постоянное состояние для idempotency/recovery; полные тексты статей и MP3 в нем не хранятся.
+- Есть только легковесное постоянное состояние для idempotency/recovery; полные тексты Telegram-постов и MP3 в нем не хранятся.
 - `notebooklm-py` неофициальный и может потребовать обновления при изменениях NotebookLM.

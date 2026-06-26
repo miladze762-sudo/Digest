@@ -29,6 +29,7 @@ def test_env_example_documents_required_digest_variables() -> None:
         "DIGEST_RANDOM_DELAY_MINUTES_MIN",
         "DIGEST_RANDOM_DELAY_MINUTES_MAX",
         "AUDIO_OVERVIEW_TIMEOUT_SECONDS",
+        "TELEGRAM_LINK_LIMIT",
     }
 
     missing = [name for name in sorted(required_names) if f"{name}=" not in env_text]
@@ -40,11 +41,7 @@ def test_trigger_python_requirements_include_digest_dependencies() -> None:
     for package_name in [
         "telethon",
         "notebooklm-py",
-        "trafilatura",
-        "readability-lxml",
         "httpx",
-        "beautifulsoup4",
-        "lxml",
         "psycopg[binary]",
     ]:
         assert package_name in requirements
